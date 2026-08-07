@@ -147,14 +147,22 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
-	if plan.DockerfilePath != "" {
+	if plan.DetectionSource == "layer1-railpack" {
+		ui.Detail("Building OCI image using Railpack (dynamic)")
+		cmd := exec.CommandContext(ctx, "railpack", "build", cwd, "--name", imageTag)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		if err := cmd.Run(); err != nil {
+			return fmt.Errorf("railpack build failed: %w", err)
+		}
+	} else if plan.DockerfilePath != "" {
 		// Use existing Dockerfile from the project
 		ui.Detail("Using existing Dockerfile: %s", color.HiBlackString(plan.DockerfilePath))
 		if err := buildWithDockerfile(ctx, cwd, plan.DockerfilePath, imageTag); err != nil {
 			return fmt.Errorf("docker build failed: %w", err)
 		}
 	} else {
-		// Generate an optimized Dockerfile from the detection build plan
+		// Generate an optimized Dockerfile from the detection build plan (Fallback for Ghost/Frappe)
 		ui.Detail("Generating Dockerfile from build plan")
 		if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
 			return fmt.Errorf("build failed: %w", err)
@@ -427,13 +435,13 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 		if plan.Runtime != "" {
 			version = plan.Runtime
 		}
-		return fmt.Sprintf("node:%s-slim", version)
+		return fmt.Sprintf("node:%s-bookworm", version)
 	case "python":
 		version := "3" // Latest Python 3.x
 		if plan.Runtime != "" {
 			version = plan.Runtime
 		}
-		return fmt.Sprintf("python:%s-slim", version)
+		return fmt.Sprintf("python:%s-bookworm", version)
 	case "go":
 		version := "1" // Latest Go 1.x
 		if plan.Runtime != "" {
@@ -451,7 +459,7 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 		if plan.Runtime != "" {
 			version = plan.Runtime
 		}
-		return fmt.Sprintf("ruby:%s-slim", version)
+		return fmt.Sprintf("ruby:%s-bookworm", version)
 	case "php":
 		version := "8" // Latest PHP 8.x
 		if plan.Runtime != "" {

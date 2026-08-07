@@ -48,19 +48,27 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	// Try Layer 0: Existing Dockerfile / Docker Compose
 	layer0Plan, err0 := detectDockerAndCompose(projectDir)
 
-	// Try Layer 1/2: Built-in framework detection
-	layer12Plan, err12 := detectOwn(projectDir, cfg)
+	// Try Layer 1: Railpack detection
+	layer1Plan, err1 := detectWithRailpack(ctx, projectDir, cfg, verbose)
 
-	// If both strategies detected valid options and no explicit config provider override exists
-	if layer0Plan != nil && layer12Plan != nil && (cfg == nil || cfg.Build.Provider == "") {
+	// Try Layer 2: Built-in framework detection
+	layer2Plan, err2 := detectOwn(projectDir, cfg)
+
+	// If existing Dockerfile setup found, prompt against the BEST detected plan
+	bestPlan := layer1Plan
+	if bestPlan == nil {
+		bestPlan = layer2Plan
+	}
+
+	if layer0Plan != nil && bestPlan != nil && (cfg == nil || cfg.Build.Provider == "") {
 		if isInteractiveTerminal() {
 			fmt.Println()
 			ui.Info(fmt.Sprintf("Existing container setup found: %s", color.CyanString(layer0Plan.DockerfilePath)))
-			ui.Info(fmt.Sprintf("Detected framework signature:  %s (%s)", color.CyanString(layer12Plan.DetectedFramework), color.CyanString(layer12Plan.Provider)))
+			ui.Info(fmt.Sprintf("Detected framework signature:  %s (%s)", color.CyanString(bestPlan.DetectedFramework), color.CyanString(bestPlan.Provider)))
 			fmt.Println()
 			fmt.Println("  Choose build method:")
 			fmt.Printf("    [1] Use existing Dockerfile (%s)\n", layer0Plan.DockerfilePath)
-			fmt.Printf("    [2] Use IdliStack Zero-Config Buildpack (%s / %s)\n", layer12Plan.DetectedFramework, layer12Plan.Provider)
+			fmt.Printf("    [2] Use IdliStack Zero-Config Buildpack (%s / %s)\n", bestPlan.DetectedFramework, bestPlan.Provider)
 			fmt.Println()
 			fmt.Print("  Select option [1/2] (default 1): ")
 
@@ -69,8 +77,8 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			choice = strings.TrimSpace(choice)
 
 			if choice == "2" {
-				applyConfigOverrides(layer12Plan, cfg)
-				return layer12Plan, nil
+				applyConfigOverrides(bestPlan, cfg)
+				return bestPlan, nil
 			}
 		}
 	}
@@ -80,9 +88,14 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 		return layer0Plan, nil
 	}
 
-	if layer12Plan != nil && err12 == nil {
-		applyConfigOverrides(layer12Plan, cfg)
-		return layer12Plan, nil
+	if layer1Plan != nil && err1 == nil {
+		applyConfigOverrides(layer1Plan, cfg)
+		return layer1Plan, nil
+	}
+
+	if layer2Plan != nil && err2 == nil {
+		applyConfigOverrides(layer2Plan, cfg)
+		return layer2Plan, nil
 	}
 
 	return nil, fmt.Errorf("could not detect application type. Create a Dockerfile or ensure your project has a recognizable structure")
@@ -277,7 +290,7 @@ func parseRailpackPlan(data []byte, projectDir string, verbose bool) (*buildplan
 	plan.DetectionSource = "layer1-railpack"
 	plan.DetectionConfidence = "high"
 
-	// Extract provider from Railpack's "providers" field
+	// Extract provider from older Railpack's "providers" field (if present)
 	if providers, ok := railpackPlan["providers"].([]interface{}); ok && len(providers) > 0 {
 		if providerMap, ok := providers[0].(map[string]interface{}); ok {
 			if name, ok := providerMap["name"].(string); ok {
@@ -286,69 +299,42 @@ func parseRailpackPlan(data []byte, projectDir string, verbose bool) (*buildplan
 		}
 	}
 
-	// Extract start command
-	if startCmd, ok := railpackPlan["start"].(map[string]interface{}); ok {
+	// Extract start command (new schema)
+	if deploy, ok := railpackPlan["deploy"].(map[string]interface{}); ok {
+		if cmd, ok := deploy["startCommand"].(string); ok {
+			plan.StartCmd = cmd
+		}
+		if vars, ok := deploy["variables"].(map[string]interface{}); ok {
+			if plan.Env == nil {
+				plan.Env = make(map[string]string)
+			}
+			for k, v := range vars {
+				if valStr, ok := v.(string); ok {
+					plan.Env[k] = valStr
+				}
+			}
+		}
+	} else if startCmd, ok := railpackPlan["start"].(map[string]interface{}); ok {
+		// Old schema fallback
 		if cmd, ok := startCmd["cmd"].(string); ok {
 			plan.StartCmd = cmd
 		}
 	}
 
-	// Extract metadata
-	if meta, ok := railpackPlan["metadata"].(map[string]interface{}); ok {
-		if pkgs, ok := meta["packages"].(map[string]interface{}); ok {
-			for name, version := range pkgs {
-				if strings.Contains(name, "node") {
-					plan.Provider = "node"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "python") {
-					plan.Provider = "python"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "go") {
-					plan.Provider = "go"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "ruby") {
-					plan.Provider = "ruby"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "java") || strings.Contains(name, "jdk") {
-					plan.Provider = "java"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "php") {
-					plan.Provider = "php"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "rust") {
-					plan.Provider = "rust"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "dotnet") || strings.Contains(name, "csharp") {
-					plan.Provider = "dotnet"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "elixir") {
-					plan.Provider = "elixir"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				} else if strings.Contains(name, "swift") {
-					plan.Provider = "swift"
-					if v, ok := version.(string); ok {
-						plan.Runtime = v
-					}
-				}
-			}
+	// Dynamic inference based on deploy/steps from new schema if provider is empty
+	if plan.Provider == "" {
+		rawStr, _ := json.Marshal(railpackPlan)
+		lowerStr := strings.ToLower(string(rawStr))
+		if strings.Contains(lowerStr, "packages:mise") || strings.Contains(lowerStr, "npm install") {
+			plan.Provider = "node"
+		} else if strings.Contains(lowerStr, "pip install") || strings.Contains(lowerStr, "python") {
+			plan.Provider = "python"
+		} else if strings.Contains(lowerStr, "go build") || strings.Contains(lowerStr, "golang") {
+			plan.Provider = "go"
+		} else if strings.Contains(lowerStr, "cargo build") || strings.Contains(lowerStr, "rust") {
+			plan.Provider = "rust"
+		} else if strings.Contains(lowerStr, "composer install") || strings.Contains(lowerStr, "php") {
+			plan.Provider = "php"
 		}
 	}
 
