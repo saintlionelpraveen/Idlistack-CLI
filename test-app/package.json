@@ -1,0 +1,1 @@
+{"name": "test-app", "version": "1.0.0", "scripts": {"start": "node server.js", "build": "echo build"}, "engines": {"node": "20"}}

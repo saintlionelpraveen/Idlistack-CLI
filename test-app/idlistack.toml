@@ -1,0 +1,18 @@
+# IdliStack Configuration
+# Documentation: https://idlistack.com/docs/config
+
+[project]
+name = "test-app"
+
+# [build]
+# provider = ""          # auto-detected if empty
+# build_cmd = ""         # override the detected build command
+# start_cmd = ""         # override the detected start command
+
+# [deploy]
+# port = 0               # auto-detected if empty
+# replicas = 1
+# health_check_path = "/health"
+
+# [env]
+# KEY = "value"
