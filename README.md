@@ -42,5 +42,5 @@ Node.js, Python, Go, Rust, Ruby, Java, PHP, Elixir, .NET, Deno, Bun, and static 
 
 - Docker
 - Minikube
-- Railpack
+- Buildpack
 - kubectl
