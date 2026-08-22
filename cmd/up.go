@@ -147,22 +147,34 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
-	if plan.DetectionSource == "layer1-railpack" {
-		ui.Detail("Building OCI image using Railpack (dynamic)")
-		cmd := exec.CommandContext(ctx, "railpack", "build", cwd, "--name", imageTag)
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
-		if err := cmd.Run(); err != nil {
-			return fmt.Errorf("railpack build failed: %w", err)
-		}
-	} else if plan.DockerfilePath != "" {
+	if plan.DockerfilePath != "" {
 		// Use existing Dockerfile from the project
 		ui.Detail("Using existing Dockerfile: %s", color.HiBlackString(plan.DockerfilePath))
 		if err := buildWithDockerfile(ctx, cwd, plan.DockerfilePath, imageTag); err != nil {
 			return fmt.Errorf("docker build failed: %w", err)
 		}
+	} else if strings.HasPrefix(plan.DetectionSource, "provider-") {
+		// Provider-detected plan: try Railpack first for optimal BuildKit builds,
+		// fall back to generating a Dockerfile from the build plan
+		if _, err := exec.LookPath("railpack"); err == nil {
+			ui.Detail("Building OCI image using Railpack (BuildKit)")
+			rpCmd := exec.CommandContext(ctx, "railpack", "build", cwd, "--name", imageTag)
+			rpCmd.Stdout = os.Stdout
+			rpCmd.Stderr = os.Stderr
+			if err := rpCmd.Run(); err != nil {
+				ui.Detail("Railpack build failed, falling back to generated Dockerfile")
+				if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
+					return fmt.Errorf("build failed: %w", err)
+				}
+			}
+		} else {
+			ui.Detail("Generating Dockerfile from build plan (provider: %s)", color.CyanString(plan.Provider))
+			if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
+				return fmt.Errorf("build failed: %w", err)
+			}
+		}
 	} else {
-		// Generate an optimized Dockerfile from the detection build plan (Fallback for Ghost/Frappe)
+		// Nixpacks/AI-detected plan: generate Dockerfile from build plan
 		ui.Detail("Generating Dockerfile from build plan")
 		if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
 			return fmt.Errorf("build failed: %w", err)
@@ -360,15 +372,17 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	df.WriteString("WORKDIR /app\n")
 
 	// Copy source
-	if plan.User != "" {
-		df.WriteString(fmt.Sprintf("COPY --chown=%s:%s . .\n", plan.User, plan.User))
-	} else {
-		df.WriteString("COPY . .\n")
-	}
+	df.WriteString("COPY . .\n")
 
 	// Add Pre-Install Command (for system deps like frappe-bench)
 	if plan.PreInstallCmd != "" {
 		df.WriteString(fmt.Sprintf("RUN %s\n", plan.PreInstallCmd))
+	}
+
+	// Set User and change ownership
+	if plan.User != "" {
+		df.WriteString(fmt.Sprintf("RUN chown -R %s:%s /app\n", plan.User, plan.User))
+		df.WriteString(fmt.Sprintf("USER %s\n", plan.User))
 	}
 
 	// Add Install Command
@@ -379,11 +393,6 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	// Add Build Command
 	if plan.BuildCmd != "" {
 		df.WriteString(fmt.Sprintf("RUN %s\n", plan.BuildCmd))
-	}
-
-	// Set User
-	if plan.User != "" {
-		df.WriteString(fmt.Sprintf("USER %s\n", plan.User))
 	}
 
 	// Add Environment Variables
