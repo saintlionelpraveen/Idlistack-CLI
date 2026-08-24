@@ -6,7 +6,9 @@ package node
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strings"
 
@@ -111,6 +113,9 @@ func (p *NodeProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error
 
 	// Framework-specific plans
 	switch p.framework {
+	case "ghost":
+		p.planGhost(ctx, plan)
+		return plan, nil // Early return to skip generic node logic
 	case "nextjs":
 		p.planNextJS(plan)
 	case "nuxt":
@@ -184,6 +189,10 @@ func (p *NodeProvider) detectPackageManager(a *app.App) string {
 // ─── Framework Sub-Detection ────────────────────────────────────────────
 
 func (p *NodeProvider) detectFramework(a *app.App) string {
+	if a.HasFile(".ghost-cli") {
+		return "ghost"
+	}
+
 	if p.packageJSON == nil {
 		return "node"
 	}
@@ -410,4 +419,38 @@ func (p *NodeProvider) getStartCommand() string {
 func (p *PackageJSON) String() string {
 	data, _ := json.MarshalIndent(p, "", "  ")
 	return string(data)
+}
+
+func (p *NodeProvider) planGhost(ctx *provider.DetectContext, plan *buildplan.Plan) {
+	plan.Port = 2368
+	plan.StartCmd = "(defined in ghost image)"
+	plan.DetectionConfidence = "high"
+
+	// Read ghost-cli config for version
+	ghostVersion := "latest"
+	if ctx.App.HasFile(".ghost-cli") {
+		type GhostCliConfig struct {
+			ActiveVersion string `json:"active-version"`
+		}
+		var cfg GhostCliConfig
+		if err := ctx.App.ReadJSON(".ghost-cli", &cfg); err == nil && cfg.ActiveVersion != "" {
+			ghostVersion = cfg.ActiveVersion
+		}
+	}
+
+	// Generate a custom Dockerfile that uses the official ghost image and copies the local content
+	dockerfileContent := fmt.Sprintf(`FROM ghost:%s-alpine
+# Copy local content (themes, images, etc.) into the ghost image
+COPY content /var/lib/ghost/content
+# Remove broken absolute symlinks copied from the host environment
+# The Ghost official entrypoint will automatically recreate these pointing to the container's version directory
+RUN rm -f /var/lib/ghost/content/themes/casper && \
+    rm -f /var/lib/ghost/content/themes/source
+`, ghostVersion)
+
+	dockerfilePath := filepath.Join(ctx.App.Source, ".idlistack", "Dockerfile.ghost")
+	os.MkdirAll(filepath.Join(ctx.App.Source, ".idlistack"), 0755)
+	os.WriteFile(dockerfilePath, []byte(dockerfileContent), 0644)
+
+	plan.DockerfilePath = filepath.Join(".idlistack", "Dockerfile.ghost")
 }
