@@ -24,9 +24,11 @@ type FrameworkRule struct {
 	Port               int             `json:"port"`
 	PreInstallCmd      string          `json:"pre_install_cmd,omitempty"`
 	InstallCmd         string          `json:"install_cmd,omitempty"`
-	BuildCmd           string          `json:"build_cmd,omitempty"`
-	StartCmd           string          `json:"start_cmd,omitempty"`
-	DockerfileTemplate string          `json:"dockerfile_template,omitempty"`
+	BuildCmd           string            `json:"build_cmd,omitempty"`
+	StartCmd           string            `json:"start_cmd,omitempty"`
+	Env                map[string]string `json:"env,omitempty"`
+	Dependencies       []string          `json:"dependencies,omitempty"`
+	DockerfileTemplate string            `json:"dockerfile_template,omitempty"`
 }
 
 type DetectCondition struct {
@@ -105,6 +107,8 @@ func detectWithRules(projectDir string, cfg *config.Config, verbose bool) (*buil
 			plan.InstallCmd = fw.InstallCmd
 			plan.BuildCmd = fw.BuildCmd
 			plan.StartCmd = fw.StartCmd
+			plan.Env = fw.Env
+			plan.Dependencies = fw.Dependencies
 			plan.DetectionSource = "layer1.5-dynamic-rules"
 			plan.DetectionConfidence = "high"
 

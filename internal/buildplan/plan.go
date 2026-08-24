@@ -22,6 +22,7 @@ type Plan struct {
 	StaticDir           string            `json:"staticDir,omitempty"`
 	DetectionConfidence string            `json:"detectionConfidence"`
 	DetectionSource     string            `json:"detectionSource"`
+	Dependencies        []string          `json:"dependencies,omitempty"`
 	User                string            `json:"user,omitempty"`
 }
 

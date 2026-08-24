@@ -478,15 +478,27 @@ func (d *Deployer) ensureDependencies(ctx context.Context) {
 
 	needsPostgres := false
 	needsRedis := false
+	needsMysql := false
 
+	allDeps := make([]string, 0)
 	if len(d.config.Deploy.Dependencies) > 0 {
-		for _, dep := range d.config.Deploy.Dependencies {
+		allDeps = append(allDeps, d.config.Deploy.Dependencies...)
+	}
+	if len(d.plan.Dependencies) > 0 {
+		allDeps = append(allDeps, d.plan.Dependencies...)
+	}
+
+	if len(allDeps) > 0 {
+		for _, dep := range allDeps {
 			depLower := strings.ToLower(dep)
 			if depLower == "postgres" || depLower == "postgresql" || depLower == "db" {
 				needsPostgres = true
 			}
 			if depLower == "redis" {
 				needsRedis = true
+			}
+			if depLower == "mysql" || depLower == "mariadb" {
+				needsMysql = true
 			}
 		}
 	} else {
@@ -590,6 +602,93 @@ spec:
 `, d.namespace, dbUser, dbPass, dbName)
 		_ = applyManifest(ctx, postgresManifest)
 		ui.Detail("Waiting for Postgres database to be ready...")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=300s")
+		_ = waitCmd.Run()
+	}
+
+	if needsMysql {
+		ui.Detail("Provisioning dependency: %s (db: %s, user: %s)", color.CyanString("MySQL (db)"), dbName, dbUser)
+		mysqlManifest := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: db
+  namespace: %[1]s
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: db
+  template:
+    metadata:
+      labels:
+        app: db
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        imagePullPolicy: IfNotPresent
+        env:
+        - name: MYSQL_USER
+          value: "%[2]s"
+        - name: MYSQL_PASSWORD
+          value: "%[3]s"
+        - name: MYSQL_DATABASE
+          value: "%[4]s"
+        - name: MYSQL_ROOT_PASSWORD
+          value: "%[3]s"
+        ports:
+        - containerPort: 3306
+        readinessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-h", "localhost"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
+        volumeMounts:
+        - name: db-data
+          mountPath: /var/lib/mysql
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: db-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-pvc
+  namespace: %[1]s
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: db
+  namespace: %[1]s
+spec:
+  selector:
+    app: db
+  ports:
+  - port: 3306
+    targetPort: 3306
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mysql-db
+  namespace: %[1]s
+spec:
+  selector:
+    app: db
+  ports:
+  - port: 3306
+    targetPort: 3306
+`, d.namespace, dbUser, dbPass, dbName)
+		_ = applyManifest(ctx, mysqlManifest)
+		ui.Detail("Waiting for MySQL database to be ready...")
 		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}

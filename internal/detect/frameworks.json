@@ -7,6 +7,14 @@
         "files": [".ghost-cli"]
       },
       "port": 2368,
+      "env": {
+        "database__client": "mysql",
+        "database__connection__host": "db",
+        "database__connection__user": "ghost",
+        "database__connection__password": "ghost",
+        "database__connection__database": "ghost"
+      },
+      "dependencies": ["mysql"],
       "start_cmd": "(defined in ghost image)",
       "dockerfile_template": "FROM ghost:{{version}}-alpine\nCOPY content /var/lib/ghost/content\nRUN rm -f /var/lib/ghost/content/themes/casper && rm -f /var/lib/ghost/content/themes/source"
     },
