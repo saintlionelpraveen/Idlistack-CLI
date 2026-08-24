@@ -18,6 +18,7 @@ import (
 	"github.com/idlistack/cli/internal/providers/registry"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/mattn/go-isatty"
+	"gopkg.in/yaml.v3"
 )
 
 func applyConfigOverrides(plan *buildplan.Plan, cfg *config.Config) {
@@ -62,7 +63,7 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 
 	// If Layer 1 found something and there's also a Dockerfile, prompt the user
 	if layer0Plan != nil && layer1Plan != nil && (cfg == nil || cfg.Build.Provider == "") {
-		if isInteractiveTerminal() {
+		if IsInteractiveTerminal() {
 			fmt.Println()
 			ui.Info(fmt.Sprintf("Existing container setup found: %s", color.CyanString(layer0Plan.DockerfilePath)))
 			ui.Info(fmt.Sprintf("Detected framework signature:  %s (%s)", color.CyanString(layer1Plan.DetectedFramework), color.CyanString(layer1Plan.Provider)))
@@ -121,7 +122,7 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	return nil, fmt.Errorf("could not detect application type. Create a Dockerfile or ensure your project has a recognizable structure")
 }
 
-func isInteractiveTerminal() bool {
+func IsInteractiveTerminal() bool {
 	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
 }
 
@@ -200,36 +201,82 @@ func detectWithProviders(projectDir string, cfg *config.Config, verbose bool) (*
 
 // ─── Layer 0: Dockerfile & Docker-Compose Detection ─────────────────────
 
+type ComposeConfig struct {
+	Services map[string]ComposeService `yaml:"services"`
+}
+
+type ComposeService struct {
+	Image       string      `yaml:"image"`
+	Build       interface{} `yaml:"build"`
+	Ports       []string    `yaml:"ports"`
+	Environment interface{} `yaml:"environment"`
+	Volumes     []string    `yaml:"volumes"`
+	Command     interface{} `yaml:"command"`
+}
+
 func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 	plan := buildplan.NewDefaultPlan()
 	var foundDockerfile string
 	var detectedPort int
 	var detectedCmd string
+	var detectedImage string
+	var detectedEnv map[string]string
+	var detectedVolumes []string
 
-	// 1. Check for docker-compose.yml or docker-compose.yaml first
-	composeFiles := []string{"docker-compose.yml", "docker-compose.yaml"}
+	// 1. Check for docker-compose.yml / compose.yml
+	composeFiles := []string{"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
 	for _, cf := range composeFiles {
 		cfPath := filepath.Join(projectDir, cf)
 		if data, err := os.ReadFile(cfPath); err == nil {
-			content := string(data)
+			var cfg ComposeConfig
+			if err := yaml.Unmarshal(data, &cfg); err != nil {
+				continue // If parsing fails, try next file
+			}
 
-			// Extract dockerfile path from compose (e.g. dockerfile: docker/Dockerfile)
-			dfRe := regexp.MustCompile(`(?i)dockerfile:\s*([^\s\n]+)`)
-			if matches := dfRe.FindStringSubmatch(content); len(matches) > 1 {
-				dfCandidate := strings.Trim(matches[1], `"'`)
-				if _, err := os.Stat(filepath.Join(projectDir, dfCandidate)); err == nil {
-					foundDockerfile = dfCandidate
+			// Find primary service. Usually the one with ports, or just the first non-database service
+			var primaryService *ComposeService
+			for name, svc := range cfg.Services {
+				// Very basic heuristic to skip databases if there are multiple services
+				if len(cfg.Services) > 1 && (strings.Contains(name, "db") || strings.Contains(name, "redis") || strings.Contains(name, "postgres") || strings.Contains(name, "mysql")) {
+					continue
+				}
+				primaryService = &svc
+				break
+			}
+
+			if primaryService == nil {
+				continue // No valid service found
+			}
+
+			detectedImage = primaryService.Image
+
+			// Extract dockerfile path from build context if present
+			if primaryService.Build != nil {
+				switch b := primaryService.Build.(type) {
+				case string:
+					// e.g. build: .
+					if _, err := os.Stat(filepath.Join(projectDir, "Dockerfile")); err == nil {
+						foundDockerfile = "Dockerfile"
+					}
+				case map[string]interface{}:
+					// e.g. build: { context: ., dockerfile: alt.Dockerfile }
+					dfCandidate := "Dockerfile"
+					if df, ok := b["dockerfile"].(string); ok {
+						dfCandidate = df
+					}
+					if _, err := os.Stat(filepath.Join(projectDir, dfCandidate)); err == nil {
+						foundDockerfile = dfCandidate
+					}
 				}
 			}
 
-			// Extract port mappings (e.g. "3000:3000" or 8080:8080)
-			portRe := regexp.MustCompile(`["']?(\d+):(\d+)["']?`)
-			allPortMatches := portRe.FindAllStringSubmatch(content, -1)
-			for _, m := range allPortMatches {
-				if len(m) > 2 {
-					var p int
-					fmt.Sscanf(m[2], "%d", &p)
-					// Avoid secondary service ports like DB/Redis if possible
+			// Extract Ports
+			for _, portStr := range primaryService.Ports {
+				// Port string can be "3000:3000", "8080", etc.
+				parts := strings.Split(portStr, ":")
+				portToParse := parts[len(parts)-1] // Take container port
+				var p int
+				if _, err := fmt.Sscanf(portToParse, "%d", &p); err == nil {
 					if p != 5432 && p != 6379 && p != 3306 && p != 27017 {
 						detectedPort = p
 						break
@@ -239,19 +286,48 @@ func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 				}
 			}
 
-			// Extract command if specified
-			cmdRe := regexp.MustCompile(`(?m)^\s*command:\s*(.+)`)
-			if m := cmdRe.FindStringSubmatch(content); len(m) > 1 {
-				rawCmd := strings.TrimSpace(m[1])
-				if strings.HasPrefix(rawCmd, "[") && strings.HasSuffix(rawCmd, "]") {
-					var parts []string
-					if json.Unmarshal([]byte(rawCmd), &parts) == nil {
-						rawCmd = strings.Join(parts, " ")
+			// Extract Environment
+			if primaryService.Environment != nil {
+				detectedEnv = make(map[string]string)
+				switch e := primaryService.Environment.(type) {
+				case map[string]interface{}:
+					for k, v := range e {
+						detectedEnv[k] = fmt.Sprintf("%v", v)
+					}
+				case []interface{}:
+					for _, v := range e {
+						str := fmt.Sprintf("%v", v)
+						parts := strings.SplitN(str, "=", 2)
+						if len(parts) == 2 {
+							detectedEnv[parts[0]] = parts[1]
+						} else if len(parts) == 1 {
+							// If value is missing, some composes leave it empty or fetch from host
+							detectedEnv[parts[0]] = ""
+						}
 					}
 				}
-				detectedCmd = rawCmd
 			}
-			break
+
+			// Extract Volumes
+			if len(primaryService.Volumes) > 0 {
+				detectedVolumes = primaryService.Volumes
+			}
+
+			// Extract Command
+			if primaryService.Command != nil {
+				switch c := primaryService.Command.(type) {
+				case string:
+					detectedCmd = c
+				case []interface{}:
+					var parts []string
+					for _, v := range c {
+						parts = append(parts, fmt.Sprintf("%v", v))
+					}
+					detectedCmd = strings.Join(parts, " ")
+				}
+			}
+
+			break // Successfully parsed one compose file
 		}
 	}
 
@@ -273,7 +349,31 @@ func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 		}
 	}
 
-	// If a Dockerfile exists (from root, subfolder, or compose reference)
+	// 3a. Compose with a pre-built image (no Dockerfile needed)
+	if detectedImage != "" && foundDockerfile == "" {
+		plan.Provider = "compose"
+		plan.DetectedFramework = "compose"
+		plan.ComposeImage = detectedImage
+		plan.DetectionSource = "layer0-compose-image"
+		plan.DetectionConfidence = "high"
+		if detectedCmd != "" {
+			plan.StartCmd = detectedCmd
+		} else {
+			plan.StartCmd = "(defined in image)"
+		}
+		if detectedPort != 0 {
+			plan.Port = detectedPort
+		}
+		if len(detectedEnv) > 0 {
+			plan.Env = detectedEnv
+		}
+		if len(detectedVolumes) > 0 {
+			plan.ComposeVolumes = detectedVolumes
+		}
+		return plan, nil
+	}
+
+	// 3b. Dockerfile exists (from root, subfolder, or compose reference)
 	if foundDockerfile != "" {
 		plan.Provider = "dockerfile"
 		plan.DetectedFramework = "custom"
@@ -286,7 +386,6 @@ func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 			plan.StartCmd = "(defined in Dockerfile)"
 		}
 
-		// Try to read EXPOSE port from Dockerfile if port not yet found
 		if data, err := os.ReadFile(filepath.Join(projectDir, foundDockerfile)); err == nil {
 			content := string(data)
 			exposeRe := regexp.MustCompile(`(?m)^EXPOSE\s+(\d+)`)
@@ -299,12 +398,14 @@ func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 			}
 		}
 
-		// Fallback to dynamic port check from config files if port is still default/zero
 		if detectedPort == 0 {
 			detectedPort = detectConfigPort(projectDir)
 		}
 		if detectedPort != 0 {
 			plan.Port = detectedPort
+		}
+		if len(detectedEnv) > 0 {
+			plan.Env = detectedEnv
 		}
 		return plan, nil
 	}

@@ -13,6 +13,8 @@ type Plan struct {
 	StartCmd            string            `json:"startCmd"`
 	Port                int               `json:"port"`
 	DockerfilePath      string            `json:"dockerfilePath,omitempty"`
+	ComposeImage        string            `json:"composeImage,omitempty"`
+	ComposeVolumes      []string          `json:"composeVolumes,omitempty"`
 	Env                 map[string]string `json:"env,omitempty"`
 	HealthCheck         HealthCheck       `json:"healthCheck"`
 	Resources           Resources         `json:"resources"`

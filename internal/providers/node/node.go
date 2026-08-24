@@ -6,6 +6,7 @@ package node
 import (
 	"encoding/json"
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -43,25 +44,50 @@ func (p *PackageJSON) HasScript(name string) bool {
 type NodeProvider struct {
 	packageJSON    *PackageJSON
 	packageManager string // npm, yarn, pnpm, bun
-	framework      string // next, nuxt, remix, astro, ghost, express, etc.
+	framework      string // next, nuxt, remix, astro, express, etc.
+	workdir        string // dynamically detected subdirectory (e.g. current, app, server)
 }
 
 func (p *NodeProvider) Name() string {
 	return "node"
 }
 
-// Detect checks for package.json or package.json5
+// Detect checks for package.json in root or common subdirectories
 func (p *NodeProvider) Detect(ctx *provider.DetectContext) (bool, error) {
-	return ctx.App.HasFile("package.json") || ctx.App.HasFile("package.json5"), nil
+	if ctx.App.HasFile("package.json") || ctx.App.HasFile("package.json5") {
+		return true, nil
+	}
+	
+	subdirs := []string{"current", "app", "server", "backend", "api"}
+	for _, dir := range subdirs {
+		if ctx.App.HasFile(fmt.Sprintf("%s/package.json", dir)) {
+			return true, nil
+		}
+	}
+	
+	return false, nil
 }
 
 // Initialize parses package.json, detects package manager and framework
 func (p *NodeProvider) Initialize(ctx *provider.DetectContext) error {
 	p.packageJSON = &PackageJSON{}
+	p.workdir = ""
 
-	if ctx.App.HasFile("package.json") {
-		if err := ctx.App.ReadJSON("package.json", p.packageJSON); err != nil {
-			return fmt.Errorf("failed to parse package.json: %w", err)
+	pkgPath := "package.json"
+	if !ctx.App.HasFile(pkgPath) {
+		subdirs := []string{"current", "app", "server", "backend", "api"}
+		for _, dir := range subdirs {
+			if ctx.App.HasFile(fmt.Sprintf("%s/package.json", dir)) {
+				pkgPath = fmt.Sprintf("%s/package.json", dir)
+				p.workdir = dir
+				break
+			}
+		}
+	}
+
+	if ctx.App.HasFile(pkgPath) {
+		if err := ctx.App.ReadJSON(pkgPath, p.packageJSON); err != nil {
+			return fmt.Errorf("failed to parse %s: %w", pkgPath, err)
 		}
 	}
 
@@ -97,16 +123,14 @@ func (p *NodeProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error
 		p.planVite(plan)
 	case "sveltekit":
 		p.planSvelteKit(plan)
-	case "ghost":
-		p.planGhost(plan, ctx.App)
 	case "express", "fastify", "nestjs", "koa", "hapi":
-		p.planServerFramework(plan)
+		p.planGenericNode(ctx, plan)
 	default:
-		p.planGenericNode(plan)
+		p.planGenericNode(ctx, plan)
 	}
 
 	// Override with package manager specific install command
-	plan.InstallCmd = p.getInstallCommand()
+	plan.InstallCmd = p.getInstallCommand(ctx.App)
 
 	// Build command from scripts
 	if plan.BuildCmd == "" && p.packageJSON.HasScript("build") {
@@ -162,11 +186,6 @@ func (p *NodeProvider) detectPackageManager(a *app.App) string {
 func (p *NodeProvider) detectFramework(a *app.App) string {
 	if p.packageJSON == nil {
 		return "node"
-	}
-
-	// Ghost CMS — unique structure
-	if a.HasFile(".ghost-cli") || (a.HasFile("current") && a.HasDir("versions")) {
-		return "ghost"
 	}
 
 	// Next.js
@@ -239,6 +258,17 @@ func (p *NodeProvider) detectNodeVersion() string {
 			}
 		}
 	}
+
+	// Fallback to host machine's Node.js version to prevent native module mismatches
+	// (like better-sqlite3) when copying node_modules directly.
+	cmd := exec.Command("node", "-v")
+	if out, err := cmd.Output(); err == nil {
+		re := regexp.MustCompile(`v(\d+)`)
+		if matches := re.FindStringSubmatch(string(out)); len(matches) > 1 {
+			return matches[1]
+		}
+	}
+
 	return "lts"
 }
 
@@ -286,43 +316,56 @@ func (p *NodeProvider) planSvelteKit(plan *buildplan.Plan) {
 	plan.Env["ORIGIN"] = "http://localhost:3000"
 }
 
-func (p *NodeProvider) planGhost(plan *buildplan.Plan, a *app.App) {
-	plan.Runtime = "18" // Ghost requires Node 18.x
-	plan.Port = 2368
-	plan.InstallCmd = ""
-	plan.BuildCmd = ""
-	plan.StartCmd = "node current/index.js"
-	plan.Env["NODE_ENV"] = "production"
-
-	// Try to extract port from Ghost config
-	configFiles := []string{"config.production.json", "config.development.json"}
-	for _, cf := range configFiles {
-		if a.HasFile(cf) {
-			var ghostConfig map[string]interface{}
-			if err := a.ReadJSON(cf, &ghostConfig); err == nil {
-				if server, ok := ghostConfig["server"].(map[string]interface{}); ok {
-					if port, ok := server["port"].(float64); ok {
-						plan.Port = int(port)
-					}
-				}
-			}
-			break
-		}
-	}
-}
-
 func (p *NodeProvider) planServerFramework(plan *buildplan.Plan) {
 	plan.Port = 3000
 	plan.StartCmd = p.getStartCommand()
 }
 
-func (p *NodeProvider) planGenericNode(plan *buildplan.Plan) {
+func (p *NodeProvider) planGenericNode(ctx *provider.DetectContext, plan *buildplan.Plan) {
+	// Dynamically try to detect a port from common config files before defaulting to 3000
 	plan.Port = 3000
+	
+	// Scan config files dynamically for a port definition
+	if p.workdir != "" {
+		if content, err := ctx.App.ReadFile(fmt.Sprintf("%s/config.development.json", p.workdir)); err == nil {
+			if strings.Contains(string(content), "\"port\":") {
+				// Just rudimentary extraction for dynamic purposes
+				re := regexp.MustCompile(`"port"\s*:\s*(\d+)`)
+				if match := re.FindStringSubmatch(string(content)); len(match) > 1 {
+					fmt.Sscanf(match[1], "%d", &plan.Port)
+				}
+			}
+		}
+	}
+	// Also check root config files just in case
+	if content, err := ctx.App.ReadFile("config.development.json"); err == nil {
+		re := regexp.MustCompile(`"port"\s*:\s*(\d+)`)
+		if match := re.FindStringSubmatch(string(content)); len(match) > 1 {
+			fmt.Sscanf(match[1], "%d", &plan.Port)
+		}
+	}
+	
+	// If the application is located in a subdirectory (like 'current')
+	// dynamically adjust the execution commands to target that directory!
+	if p.workdir != "" {
+		plan.PreInstallCmd = fmt.Sprintf("cd %s && npm rebuild || true", p.workdir)
+		if p.packageJSON.Main != "" {
+			plan.StartCmd = fmt.Sprintf("node %s/%s", p.workdir, p.packageJSON.Main)
+		} else {
+			plan.StartCmd = fmt.Sprintf("node %s/index.js", p.workdir)
+		}
+		plan.InstallCmd = "" // Assuming it's already installed if nested
+	} else {
+		plan.StartCmd = p.getStartCommand()
+	}
 }
 
 // ─── Command Helpers ────────────────────────────────────────────────────
 
-func (p *NodeProvider) getInstallCommand() string {
+func (p *NodeProvider) getInstallCommand(a *app.App) string {
+	if !a.HasFile("package.json") {
+		return ""
+	}
 	switch p.packageManager {
 	case "pnpm":
 		return "pnpm install --frozen-lockfile"

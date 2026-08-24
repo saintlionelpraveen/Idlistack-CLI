@@ -147,7 +147,21 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
-	if plan.DockerfilePath != "" {
+	if plan.ComposeImage != "" {
+		// Compose-based deployment: pull the pre-built image from registry
+		ui.Detail("Pulling image from registry: %s", color.CyanString(plan.ComposeImage))
+		pullCmd := exec.CommandContext(ctx, "docker", "pull", plan.ComposeImage)
+		pullCmd.Stdout = os.Stdout
+		pullCmd.Stderr = os.Stderr
+		if err := pullCmd.Run(); err != nil {
+			return fmt.Errorf("docker pull failed: %w", err)
+		}
+		// Tag it with idlistack naming convention for minikube
+		tagCmd := exec.CommandContext(ctx, "docker", "tag", plan.ComposeImage, imageTag)
+		if err := tagCmd.Run(); err != nil {
+			return fmt.Errorf("docker tag failed: %w", err)
+		}
+	} else if plan.DockerfilePath != "" {
 		// Use existing Dockerfile from the project
 		ui.Detail("Using existing Dockerfile: %s", color.HiBlackString(plan.DockerfilePath))
 		if err := buildWithDockerfile(ctx, cwd, plan.DockerfilePath, imageTag); err != nil {
@@ -366,18 +380,35 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	// Determine Base Image based on provider and detected runtime version
 	baseImage := resolveBaseImage(plan)
 
-	// Generate Dockerfile content
+	// Generate Dockerfile content - Multi-Stage Architecture
 	var df strings.Builder
-	df.WriteString(fmt.Sprintf("FROM %s\n", baseImage))
+	
+	// --- Stage 1: Builder ---
+	df.WriteString(fmt.Sprintf("FROM %s AS builder\n", baseImage))
 	df.WriteString("WORKDIR /app\n")
-
-	// Copy source
 	df.WriteString("COPY . .\n")
 
-	// Add Pre-Install Command (for system deps like frappe-bench)
+	// Pre-Install Command
 	if plan.PreInstallCmd != "" {
 		df.WriteString(fmt.Sprintf("RUN %s\n", plan.PreInstallCmd))
 	}
+
+	// Install Command
+	if plan.InstallCmd != "" {
+		df.WriteString(fmt.Sprintf("RUN %s\n", plan.InstallCmd))
+	} else if plan.Provider == "node" {
+		// Generic fallback to rebuild native modules (like better-sqlite3) dynamically
+		df.WriteString("RUN npm rebuild || true\n")
+	}
+
+	// Build Command
+	if plan.BuildCmd != "" {
+		df.WriteString(fmt.Sprintf("RUN %s\n", plan.BuildCmd))
+	}
+
+	// --- Stage 2: Runtime ---
+	df.WriteString(fmt.Sprintf("\nFROM %s\n", baseImage))
+	df.WriteString("WORKDIR /app\n")
 
 	// Set User and change ownership
 	if plan.User != "" {
@@ -385,15 +416,10 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 		df.WriteString(fmt.Sprintf("USER %s\n", plan.User))
 	}
 
-	// Add Install Command
-	if plan.InstallCmd != "" {
-		df.WriteString(fmt.Sprintf("RUN %s\n", plan.InstallCmd))
-	}
+	// Copy from builder
+	df.WriteString("COPY --from=builder /app .\n")
 
-	// Add Build Command
-	if plan.BuildCmd != "" {
-		df.WriteString(fmt.Sprintf("RUN %s\n", plan.BuildCmd))
-	}
+
 
 	// Add Environment Variables
 	if plan.Env != nil {

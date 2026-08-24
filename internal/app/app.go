@@ -67,7 +67,15 @@ func NewApp(source string) (*App, error) {
 
 // HasFile checks if a file exists in the project (relative path).
 func (a *App) HasFile(name string) bool {
-	return a.files[name]
+	if a.files[name] {
+		return true
+	}
+	// Fallback for symlinks or unscanned files
+	info, err := os.Stat(filepath.Join(a.Source, name))
+	if err == nil && !info.IsDir() {
+		return true
+	}
+	return false
 }
 
 // HasDir checks if a directory exists in the project (relative path).

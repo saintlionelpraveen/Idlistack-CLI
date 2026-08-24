@@ -13,7 +13,12 @@ type Config struct {
 	Project ProjectConfig         `toml:"project"`
 	Build   BuildConfig           `toml:"build"`
 	Deploy  DeployConfig          `toml:"deploy"`
+	AI      AIConfig              `toml:"ai"`
 	Env     map[string]string     `toml:"env"`
+}
+
+type AIConfig struct {
+	ApiKey string `toml:"api_key"`
 }
 
 type ProjectConfig struct {
@@ -29,9 +34,10 @@ type BuildConfig struct {
 }
 
 type DeployConfig struct {
-	Port            int    `toml:"port"`
-	Replicas        int    `toml:"replicas"`
-	HealthCheckPath string `toml:"health_check_path"`
+	Port            int      `toml:"port"`
+	Replicas        int      `toml:"replicas"`
+	HealthCheckPath string   `toml:"health_check_path"`
+	Dependencies    []string `toml:"dependencies"`
 }
 
 // LinkConfig represents the internal .idlistack/link.json state

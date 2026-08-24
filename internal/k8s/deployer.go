@@ -159,6 +159,15 @@ func (d *Deployer) applyManifests(ctx context.Context, hasSecrets bool, secretNa
               name: %s`, secretName)
 	}
 
+	// Generate inline env vars from plan (e.g. from docker-compose.yml)
+	envSection := ""
+	if len(d.plan.Env) > 0 {
+		envSection = "\n        env:"
+		for k, v := range d.plan.Env {
+			envSection += fmt.Sprintf("\n        - name: %s\n          value: \"%s\"", k, v)
+		}
+	}
+
 	// Use TCP socket probes instead of HTTP — works for ALL apps
 	// regardless of whether they have a /health endpoint.
 	// startupProbe gives the app up to 150s (30 * 5s) to boot before
@@ -215,7 +224,7 @@ spec:
           initialDelaySeconds: 0
           periodSeconds: 5
           failureThreshold: 3
-          timeoutSeconds: 3%s
+          timeoutSeconds: 3%s%s
       securityContext:
         runAsNonRoot: false
 `,
@@ -233,6 +242,7 @@ spec:
 		port,
 		port,
 		envFromSection,
+		envSection,
 	)
 
 	if err := applyManifest(ctx, deploymentManifest); err != nil {
@@ -469,19 +479,31 @@ func (d *Deployer) ensureDependencies(ctx context.Context) {
 	needsPostgres := false
 	needsRedis := false
 
-	filesToScan := []string{"docker-compose.yml", "docker-compose.yaml", "config.toml", "config.example.toml", ".env", ".env.example", "idlistack.toml"}
-	for _, fname := range filesToScan {
-		fpath := filepath.Join(d.projectDir, fname)
-		content, err := os.ReadFile(fpath)
-		if err != nil {
-			continue
+	if len(d.config.Deploy.Dependencies) > 0 {
+		for _, dep := range d.config.Deploy.Dependencies {
+			depLower := strings.ToLower(dep)
+			if depLower == "postgres" || depLower == "postgresql" || depLower == "db" {
+				needsPostgres = true
+			}
+			if depLower == "redis" {
+				needsRedis = true
+			}
 		}
-		str := strings.ToLower(string(content))
-		if strings.Contains(str, "postgres") || strings.Contains(str, "host = \"db\"") || strings.Contains(str, "host=\"db\"") || strings.Contains(str, "db:5432") || strings.Contains(str, "5432") {
-			needsPostgres = true
-		}
-		if strings.Contains(str, "redis") || strings.Contains(str, "host = \"redis\"") || strings.Contains(str, "host=\"redis\"") || strings.Contains(str, "redis:6379") || strings.Contains(str, "6379") {
-			needsRedis = true
+	} else {
+		filesToScan := []string{"docker-compose.yml", "docker-compose.yaml", "config.toml", "config.example.toml", ".env", ".env.example", "idlistack.toml"}
+		for _, fname := range filesToScan {
+			fpath := filepath.Join(d.projectDir, fname)
+			content, err := os.ReadFile(fpath)
+			if err != nil {
+				continue
+			}
+			str := strings.ToLower(string(content))
+			if strings.Contains(str, "postgres") || strings.Contains(str, "host = \"db\"") || strings.Contains(str, "host=\"db\"") || strings.Contains(str, "db:5432") || strings.Contains(str, "5432") {
+				needsPostgres = true
+			}
+			if strings.Contains(str, "redis") || strings.Contains(str, "host = \"redis\"") || strings.Contains(str, "host=\"redis\"") || strings.Contains(str, "redis:6379") || strings.Contains(str, "6379") {
+				needsRedis = true
+			}
 		}
 	}
 
@@ -522,6 +544,25 @@ spec:
             command: ["pg_isready", "-U", "%[2]s"]
           initialDelaySeconds: 2
           periodSeconds: 2
+        volumeMounts:
+        - name: db-data
+          mountPath: /var/lib/postgresql/data
+      volumes:
+      - name: db-data
+        persistentVolumeClaim:
+          claimName: db-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: db-pvc
+  namespace: %[1]s
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
 ---
 apiVersion: v1
 kind: Service
@@ -549,7 +590,7 @@ spec:
 `, d.namespace, dbUser, dbPass, dbName)
 		_ = applyManifest(ctx, postgresManifest)
 		ui.Detail("Waiting for Postgres database to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=60s")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}
 
@@ -581,6 +622,25 @@ spec:
             port: 6379
           initialDelaySeconds: 1
           periodSeconds: 2
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-pvc
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-pvc
+  namespace: %[1]s
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 1Gi
 ---
 apiVersion: v1
 kind: Service
@@ -596,7 +656,7 @@ spec:
 `, d.namespace)
 		_ = applyManifest(ctx, redisManifest)
 		ui.Detail("Waiting for Redis service to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=redis", "-n", d.namespace, "--timeout=60s")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=redis", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}
 }

@@ -8,6 +8,7 @@ import (
 
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/config"
+	"github.com/idlistack/cli/internal/detect"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/spf13/cobra"
 )
@@ -68,6 +69,51 @@ func runInit(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("failed to write link.json: %w", err)
 	}
 
+	// Attempt detection to auto-populate the config
+	ui.Info("Detecting application for initial configuration...")
+	plan, _ := detect.Detect(cmd.Context(), cwd, nil, false)
+
+	var buildSection, deploySection string
+	if plan != nil {
+		ui.Success(fmt.Sprintf("Detected %s application", color.CyanString(plan.Provider)))
+		buildSection = fmt.Sprintf(`[build]
+provider = "%s"`, plan.Provider)
+		
+		if plan.Runtime != "" {
+			buildSection += fmt.Sprintf("\nruntime = \"%s\"", plan.Runtime)
+		}
+		if plan.PreInstallCmd != "" {
+			buildSection += fmt.Sprintf("\npre_install_cmd = %q", plan.PreInstallCmd)
+		}
+		if plan.InstallCmd != "" {
+			buildSection += fmt.Sprintf("\ninstall_cmd = %q", plan.InstallCmd)
+		}
+		if plan.BuildCmd != "" {
+			buildSection += fmt.Sprintf("\nbuild_cmd = %q", plan.BuildCmd)
+		}
+		if plan.StartCmd != "" {
+			buildSection += fmt.Sprintf("\nstart_cmd = %q", plan.StartCmd)
+		}
+
+		deploySection = "[deploy]\n"
+		if plan.Port > 0 {
+			deploySection += fmt.Sprintf("port = %d\n", plan.Port)
+		} else {
+			deploySection += "# port = 0\n"
+		}
+		deploySection += "replicas = 1\nhealth_check_path = \"/health\""
+	} else {
+		ui.Warn("Could not automatically detect application, generating template config")
+		buildSection = `# [build]
+# provider = ""          # auto-detected if empty
+# build_cmd = ""         # override the detected build command
+# start_cmd = ""         # override the detected start command`
+		deploySection = `# [deploy]
+# port = 0               # auto-detected if empty
+# replicas = 1
+# health_check_path = "/health"`
+	}
+
 	// Create idlistack.toml
 	tomlContent := fmt.Sprintf(`# IdliStack Configuration
 # Documentation: https://idlistack.com/docs/config
@@ -75,19 +121,13 @@ func runInit(cmd *cobra.Command, args []string) error {
 [project]
 name = "%s"
 
-# [build]
-# provider = ""          # auto-detected if empty
-# build_cmd = ""         # override the detected build command
-# start_cmd = ""         # override the detected start command
+%s
 
-# [deploy]
-# port = 0               # auto-detected if empty
-# replicas = 1
-# health_check_path = "/health"
+%s
 
 # [env]
 # KEY = "value"
-`, projectName)
+`, projectName, buildSection, deploySection)
 
 	if err := os.WriteFile(configPath, []byte(tomlContent), 0644); err != nil {
 		return fmt.Errorf("failed to write idlistack.toml: %w", err)
