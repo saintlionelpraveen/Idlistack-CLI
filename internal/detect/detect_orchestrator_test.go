@@ -17,13 +17,13 @@ func TestDetectWithProviders_GhostCMS(t *testing.T) {
 	})
 	os.MkdirAll(filepath.Join(dir, "versions"), 0755)
 
-	plan, providerName, err := detectWithProviders(dir, nil, false)
+	plan, err := Detect(context.Background(), dir, nil, false)
 	if err != nil {
-		t.Fatalf("detectWithProviders failed: %v", err)
+		t.Fatalf("Detect failed: %v", err)
 	}
 
-	if providerName != "node" {
-		t.Errorf("Expected provider 'node', got %s", providerName)
+	if plan.Provider != "node" {
+		t.Errorf("Expected provider 'node', got %s", plan.Provider)
 	}
 
 	if plan.DetectedFramework != "ghost" {

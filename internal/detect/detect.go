@@ -58,11 +58,38 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	// ─── Layer 0: Existing Dockerfile / Docker Compose ──────────────
 	layer0Plan, err0 := detectDockerAndCompose(projectDir)
 
+	// ─── Layer 0.5: Dynamic Rules Detection ─────────────────────────
+	layer05Plan, err05 := detectWithRules(projectDir, cfg, verbose)
+
 	// ─── Layer 1: Native Provider Detection (primary engine) ────────
 	layer1Plan, providerName, err1 := detectWithProviders(projectDir, cfg, verbose)
 
+	// If Layer 0.5 found something and there's also a Dockerfile, prompt the user
+	if layer0Plan != nil && layer05Plan != nil && (cfg == nil || cfg.Build.Provider == "") {
+		if IsInteractiveTerminal() {
+			fmt.Println()
+			ui.Info(fmt.Sprintf("Existing container setup found: %s", color.CyanString(layer0Plan.DockerfilePath)))
+			ui.Info(fmt.Sprintf("Detected framework signature (rules): %s (%s)", color.CyanString(layer05Plan.DetectedFramework), color.CyanString(layer05Plan.Provider)))
+			fmt.Println()
+			fmt.Println("  Choose build method:")
+			fmt.Printf("    [1] Use existing Dockerfile (%s)\n", layer0Plan.DockerfilePath)
+			fmt.Printf("    [2] Use IdliStack Zero-Config Buildpack (%s / %s)\n", layer05Plan.DetectedFramework, layer05Plan.Provider)
+			fmt.Println()
+			fmt.Print("  Select option [1/2] (default 1): ")
+
+			var choice string
+			fmt.Scanln(&choice)
+			choice = strings.TrimSpace(choice)
+
+			if choice == "2" {
+				applyConfigOverrides(layer05Plan, cfg)
+				return layer05Plan, nil
+			}
+		}
+	}
+
 	// If Layer 1 found something and there's also a Dockerfile, prompt the user
-	if layer0Plan != nil && layer1Plan != nil && (cfg == nil || cfg.Build.Provider == "") {
+	if layer0Plan != nil && layer1Plan != nil && layer05Plan == nil && (cfg == nil || cfg.Build.Provider == "") {
 		if IsInteractiveTerminal() {
 			fmt.Println()
 			ui.Info(fmt.Sprintf("Existing container setup found: %s", color.CyanString(layer0Plan.DockerfilePath)))
@@ -91,6 +118,15 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	if layer0Plan != nil && err0 == nil {
 		applyConfigOverrides(layer0Plan, cfg)
 		return layer0Plan, nil
+	}
+
+	// Layer 0.5: Dynamic Rules Detection
+	if layer05Plan != nil && err05 == nil {
+		if verbose {
+			ui.Detail("Detected by dynamic rules: %s", color.CyanString(layer05Plan.DetectedFramework))
+		}
+		applyConfigOverrides(layer05Plan, cfg)
+		return layer05Plan, nil
 	}
 
 	// Layer 1: Native provider detection (our primary engine)

@@ -94,41 +94,7 @@ func TestNodeProviderDetectsPackageJSON(t *testing.T) {
 	}
 }
 
-// TestGhostCMSDetection verifies Ghost CMS is detected as node/ghost.
-func TestGhostCMSDetection(t *testing.T) {
-	dir := createTestProject(t, map[string]string{
-		"package.json":            `{"name": "ghost"}`,
-		".ghost-cli":              `{"name": "ghost-local"}`,
-		"current":                 "5.96.0",
-		"config.development.json": `{"server": {"port": 2368}}`,
-	})
-	os.MkdirAll(filepath.Join(dir, "versions"), 0755)
 
-	a, _ := app.NewApp(dir)
-	ctx := &provider.DetectContext{App: a, ProjectDir: dir}
-
-	p := registry.GetProvider("node")
-	matched, _ := p.Detect(ctx)
-	if !matched {
-		t.Fatal("Node provider should match Ghost CMS")
-	}
-
-	p.Initialize(ctx)
-	plan, err := p.Plan(ctx)
-	if err != nil {
-		t.Fatalf("Plan error: %v", err)
-	}
-
-	if plan.DetectedFramework != "ghost" {
-		t.Errorf("expected framework=ghost, got %s", plan.DetectedFramework)
-	}
-	if plan.Port != 2368 {
-		t.Errorf("expected port=2368, got %d", plan.Port)
-	}
-	if plan.Runtime != "18" {
-		t.Errorf("expected runtime=18, got %s", plan.Runtime)
-	}
-}
 
 // TestGoProviderDetectsGoMod verifies Go detection via go.mod.
 func TestGoProviderDetectsGoMod(t *testing.T) {

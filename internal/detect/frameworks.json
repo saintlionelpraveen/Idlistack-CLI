@@ -1,0 +1,43 @@
+{
+  "frameworks": [
+    {
+      "id": "ghost",
+      "provider": "node",
+      "detect": {
+        "files": [".ghost-cli"]
+      },
+      "port": 2368,
+      "start_cmd": "(defined in ghost image)",
+      "dockerfile_template": "FROM ghost:{{version}}-alpine\nCOPY content /var/lib/ghost/content\nRUN rm -f /var/lib/ghost/content/themes/casper && rm -f /var/lib/ghost/content/themes/source"
+    },
+    {
+      "id": "nextjs",
+      "provider": "node",
+      "detect": {
+        "dependencies": ["next"]
+      },
+      "port": 3000,
+      "build_cmd": "npm run build",
+      "start_cmd": "npm start"
+    },
+    {
+      "id": "nuxt",
+      "provider": "node",
+      "detect": {
+        "dependencies": ["nuxt", "nuxt-edge"]
+      },
+      "port": 3000,
+      "build_cmd": "npm run build",
+      "start_cmd": "npm run start"
+    },
+    {
+      "id": "django",
+      "provider": "python",
+      "detect": {
+        "dependencies": ["Django", "django"]
+      },
+      "port": 8000,
+      "start_cmd": "python manage.py runserver 0.0.0.0:8000"
+    }
+  ]
+}

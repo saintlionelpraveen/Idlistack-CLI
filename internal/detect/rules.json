@@ -1,0 +1,100 @@
+{
+  "providers": [
+    {
+      "id": "node",
+      "detect": {
+        "files": ["package.json", "current/package.json"]
+      },
+      "frameworks": [
+        {
+          "id": "ghost",
+          "detect": {
+            "files": [".ghost-cli"]
+          },
+          "port": 2368,
+          "start_cmd": "(defined in ghost image)",
+          "dockerfile_template": "FROM ghost:{{version}}-alpine\nCOPY content /var/lib/ghost/content\nRUN rm -f /var/lib/ghost/content/themes/casper && rm -f /var/lib/ghost/content/themes/source"
+        },
+        {
+          "id": "nextjs",
+          "detect": {
+            "dependencies": ["next"]
+          },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm start",
+          "env": {
+            "NODE_ENV": "production"
+          }
+        },
+        {
+          "id": "express",
+          "detect": {
+            "dependencies": ["express"]
+          },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "start_cmd": "npm start",
+          "env": {
+            "NODE_ENV": "production"
+          }
+        }
+      ],
+      "default": {
+        "id": "node",
+        "port": 3000,
+        "install_cmd": "npm install",
+        "start_cmd": "npm start",
+        "env": {
+          "NODE_ENV": "production"
+        }
+      }
+    },
+    {
+      "id": "python",
+      "detect": {
+        "files": ["requirements.txt", "pyproject.toml", "setup.py"]
+      },
+      "frameworks": [
+        {
+          "id": "django",
+          "detect": {
+            "dependencies": ["Django", "django"]
+          },
+          "port": 8000,
+          "install_cmd": "pip install -r requirements.txt",
+          "start_cmd": "python manage.py runserver 0.0.0.0:8000"
+        },
+        {
+          "id": "fastapi",
+          "detect": {
+            "dependencies": ["fastapi", "FastAPI"]
+          },
+          "port": 8000,
+          "install_cmd": "pip install -r requirements.txt",
+          "start_cmd": "uvicorn main:app --host 0.0.0.0 --port 8000"
+        }
+      ],
+      "default": {
+        "id": "python",
+        "port": 5000,
+        "install_cmd": "pip install -r requirements.txt",
+        "start_cmd": "python app.py"
+      }
+    },
+    {
+      "id": "go",
+      "detect": {
+        "files": ["go.mod"]
+      },
+      "frameworks": [],
+      "default": {
+        "id": "go",
+        "port": 8080,
+        "build_cmd": "go build -o app .",
+        "start_cmd": "./app"
+      }
+    }
+  ]
+}
