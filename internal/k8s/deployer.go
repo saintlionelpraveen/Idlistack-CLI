@@ -84,7 +84,9 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	}
 
 	// ─── Ensure Dependency Services (Postgres, Redis, etc.) ─────────
-	d.ensureDependencies(ctx)
+	if err := d.ensureDependencies(ctx); err != nil {
+		return "", fmt.Errorf("dependency provisioning failed: %w", err)
+	}
 
 	// ─── Pre-deploy jobs ────────────────────────────────────────────
 	if d.plan.PreDeployCmd != "" {
@@ -469,9 +471,9 @@ func (d *Deployer) extractDbCredentials() (user, pass, dbname string) {
 	return user, pass, dbname
 }
 
-func (d *Deployer) ensureDependencies(ctx context.Context) {
+func (d *Deployer) ensureDependencies(ctx context.Context) error {
 	if d.projectDir == "" {
-		return
+		return nil
 	}
 
 	dbUser, dbPass, dbName := d.extractDbCredentials()
@@ -603,7 +605,9 @@ spec:
 		_ = applyManifest(ctx, postgresManifest)
 		ui.Detail("Waiting for Postgres database to be ready...")
 		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
-		_ = waitCmd.Run()
+		if err := waitCmd.Run(); err != nil {
+			return fmt.Errorf("Postgres failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
+		}
 	}
 
 	if needsMysql {
@@ -690,7 +694,9 @@ spec:
 		_ = applyManifest(ctx, mysqlManifest)
 		ui.Detail("Waiting for MySQL database to be ready...")
 		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
-		_ = waitCmd.Run()
+		if err := waitCmd.Run(); err != nil {
+			return fmt.Errorf("MySQL failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
+		}
 	}
 
 	if needsRedis {
@@ -756,6 +762,9 @@ spec:
 		_ = applyManifest(ctx, redisManifest)
 		ui.Detail("Waiting for Redis service to be ready...")
 		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/redis", "-n", d.namespace, "--timeout=300s")
-		_ = waitCmd.Run()
+		if err := waitCmd.Run(); err != nil {
+			return fmt.Errorf("Redis failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
+		}
 	}
+	return nil
 }

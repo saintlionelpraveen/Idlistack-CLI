@@ -1,0 +1,26 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-db
+  namespace: default
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-db
+  template:
+    metadata:
+      labels:
+        app: test-db
+    spec:
+      containers:
+      - name: mysql
+        image: mysql:8.0
+        env:
+        - name: MYSQL_ROOT_PASSWORD
+          value: "test"
+        readinessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-h", "localhost", "-u", "root", "-ptest"]
+          initialDelaySeconds: 10
+          periodSeconds: 5
