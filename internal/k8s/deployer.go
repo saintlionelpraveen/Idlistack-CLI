@@ -602,7 +602,7 @@ spec:
 `, d.namespace, dbUser, dbPass, dbName)
 		_ = applyManifest(ctx, postgresManifest)
 		ui.Detail("Waiting for Postgres database to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=300s")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}
 
@@ -640,7 +640,7 @@ spec:
         - containerPort: 3306
         readinessProbe:
           exec:
-            command: ["mysqladmin", "ping", "-h", "localhost"]
+            command: ["mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p%[3]s"]
           initialDelaySeconds: 10
           periodSeconds: 5
         volumeMounts:
@@ -689,7 +689,7 @@ spec:
 `, d.namespace, dbUser, dbPass, dbName)
 		_ = applyManifest(ctx, mysqlManifest)
 		ui.Detail("Waiting for MySQL database to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=db", "-n", d.namespace, "--timeout=300s")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}
 
@@ -755,7 +755,7 @@ spec:
 `, d.namespace)
 		_ = applyManifest(ctx, redisManifest)
 		ui.Detail("Waiting for Redis service to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=ready", "pod", "-l", "app=redis", "-n", d.namespace, "--timeout=300s")
+		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/redis", "-n", d.namespace, "--timeout=300s")
 		_ = waitCmd.Run()
 	}
 }
