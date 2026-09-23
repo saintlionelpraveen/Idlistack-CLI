@@ -42,10 +42,11 @@ func (p *PackageJSON) HasScript(name string) bool {
 }
 
 type NodeProvider struct {
-	packageJSON    *PackageJSON
-	packageManager string // npm, yarn, pnpm, bun
-	framework      string // next, nuxt, remix, astro, express, etc.
-	workdir        string // dynamically detected subdirectory (e.g. current, app, server)
+	packageJSON      *PackageJSON
+	packageManager   string // npm, yarn, pnpm, bun
+	framework        string // next, nuxt, remix, astro, express, etc.
+	frameworkVersion string
+	workdir          string // dynamically detected subdirectory (e.g. current, app, server)
 }
 
 func (p *NodeProvider) Name() string {
@@ -93,15 +94,48 @@ func (p *NodeProvider) Initialize(ctx *provider.DetectContext) error {
 
 	p.packageManager = p.detectPackageManager(ctx.App)
 	p.framework = p.detectFramework(ctx.App)
+	p.frameworkVersion = p.detectFrameworkVersion()
 	return nil
+}
+
+func (p *NodeProvider) detectFrameworkVersion() string {
+	if p.packageJSON == nil {
+		return ""
+	}
+	depMap := map[string]string{
+		"next":      "next",
+		"nuxt":      "nuxt",
+		"remix":     "@remix-run/react",
+		"astro":     "astro",
+		"vite":      "vite",
+		"sveltekit": "@sveltejs/kit",
+		"express":   "express",
+		"fastify":   "fastify",
+		"nestjs":    "@nestjs/core",
+	}
+	depName := depMap[p.framework]
+	if depName == "" {
+		depName = p.framework
+	}
+	if v, ok := p.packageJSON.Dependencies[depName]; ok {
+		return strings.Trim(v, "^~>=< ")
+	}
+	if v, ok := p.packageJSON.DevDependencies[depName]; ok {
+		return strings.Trim(v, "^~>=< ")
+	}
+	return ""
 }
 
 // Plan generates the build plan based on detected framework
 func (p *NodeProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error) {
 	plan := buildplan.NewDefaultPlan()
 	plan.Provider = "node"
+	plan.Stack = "Node.js"
+	plan.StackVersion = p.detectNodeVersion()
+	plan.Runtime = plan.StackVersion
 	plan.DetectedFramework = p.framework
-	plan.Runtime = p.detectNodeVersion()
+	plan.Framework = p.framework
+	plan.FrameworkVersion = p.frameworkVersion
 
 	// Set environment variables
 	plan.Env = map[string]string{
@@ -140,6 +174,7 @@ func (p *NodeProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error
 		plan.StartCmd = p.getStartCommand()
 	}
 
+	plan.Normalize()
 	return plan, nil
 }
 

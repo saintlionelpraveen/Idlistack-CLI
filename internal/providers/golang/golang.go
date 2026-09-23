@@ -35,20 +35,33 @@ func (p *GoProvider) Initialize(ctx *provider.DetectContext) error {
 func (p *GoProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error) {
 	plan := buildplan.NewDefaultPlan()
 	plan.Provider = "go"
-	plan.DetectedFramework = "go"
+	plan.Stack = "Go"
+	plan.StackVersion = p.goVersion
 	plan.Runtime = p.goVersion
+	plan.DetectedFramework = "go"
+	plan.Framework = "go"
 	plan.Port = 8080
 
-	// Check for common Go web frameworks
+	// Check for common Go web frameworks and versions
 	if ctx.App.HasFile("go.mod") {
-		if ctx.App.HasFileWithContent("go.mod", "github.com/gin-gonic/gin") {
-			plan.DetectedFramework = "gin"
-		} else if ctx.App.HasFileWithContent("go.mod", "github.com/labstack/echo") {
-			plan.DetectedFramework = "echo"
-		} else if ctx.App.HasFileWithContent("go.mod", "github.com/gofiber/fiber") {
-			plan.DetectedFramework = "fiber"
-		} else if ctx.App.HasFileWithContent("go.mod", "github.com/gorilla/mux") {
-			plan.DetectedFramework = "gorilla"
+		if content, err := ctx.App.ReadFileString("go.mod"); err == nil {
+			frameworkMap := map[string]string{
+				"github.com/gin-gonic/gin": "gin",
+				"github.com/labstack/echo": "echo",
+				"github.com/gofiber/fiber": "fiber",
+				"github.com/gorilla/mux":   "gorilla",
+			}
+			for mod, name := range frameworkMap {
+				if strings.Contains(content, mod) {
+					plan.DetectedFramework = name
+					plan.Framework = name
+					re := regexp.MustCompile(regexp.QuoteMeta(mod) + `\s+v?([\d\.]+)`)
+					if m := re.FindStringSubmatch(content); len(m) > 1 {
+						plan.FrameworkVersion = m[1]
+					}
+					break
+				}
+			}
 		}
 	}
 
@@ -78,6 +91,7 @@ func (p *GoProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error) 
 		"GOOS":        "linux",
 	}
 
+	plan.Normalize()
 	return plan, nil
 }
 

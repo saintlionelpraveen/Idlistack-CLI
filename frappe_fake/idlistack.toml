@@ -1,0 +1,17 @@
+# IdliStack Configuration
+# Documentation: https://idlistack.com/docs/config
+
+[project]
+name = "frappe_fake"
+
+[build]
+provider = "python"
+start_cmd = "(defined in frappe image)"
+
+[deploy]
+port = 8000
+replicas = 1
+health_check_path = "/health"
+
+# [env]
+# KEY = "value"

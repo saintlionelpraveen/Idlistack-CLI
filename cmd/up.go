@@ -31,8 +31,8 @@ var upCmd = &cobra.Command{
   2. Detects language, framework, and configuration
   3. Generates a build plan (JSON)
   4. Builds an OCI image via Railpack + BuildKit
-  5. Loads the image into Minikube
-  6. Deploys to Kubernetes with health checks
+  5. Loads the image into K3s
+  6. Deploys to Kubernetes via Helm
 
 Use --inspect to preview the build plan without building or deploying.
 Use --detach to run the deployment in the background.`,
@@ -64,10 +64,20 @@ func runUp(cmd *cobra.Command, args []string) error {
 
 	cfg, err := config.Load(cwd)
 	if err != nil {
-		ui.Error("Project not initialized. Run 'idlistack init' first.")
-		return fmt.Errorf("no idlistack.toml found: %w", err)
+		if upInspect {
+			cfg = &config.Config{
+				Project: config.ProjectConfig{
+					Name: filepath.Base(cwd),
+				},
+			}
+			ui.Detail("Project: %s (preview)", color.CyanString(cfg.Project.Name))
+		} else {
+			ui.Error("Project not initialized. Run 'idlistack init' first.")
+			return fmt.Errorf("no idlistack.toml found: %w", err)
+		}
+	} else {
+		ui.Detail("Project: %s", color.CyanString(cfg.Project.Name))
 	}
-	ui.Detail("Project: %s", color.CyanString(cfg.Project.Name))
 
 	// Check source size (50MB limit)
 	sourceSize, err := calculateDirSize(cwd)
@@ -90,9 +100,25 @@ func runUp(cmd *cobra.Command, args []string) error {
 		return fmt.Errorf("detection failed: %w", err)
 	}
 
-	ui.Detail("Provider:  %s", color.CyanString(plan.Provider))
-	ui.Detail("Runtime:   %s", color.CyanString(plan.Runtime))
-	ui.Detail("Framework: %s", color.CyanString(plan.DetectedFramework))
+	stackDisplay := plan.Stack
+	if stackDisplay == "" {
+		stackDisplay = plan.Provider
+	}
+	if plan.Runtime != "" && plan.Runtime != "latest" && plan.Runtime != "lts" {
+		stackDisplay = fmt.Sprintf("%s (v%s)", stackDisplay, plan.Runtime)
+	} else if plan.Runtime != "" {
+		stackDisplay = fmt.Sprintf("%s (%s)", stackDisplay, plan.Runtime)
+	}
+
+	ui.Detail("Stack:     %s", color.CyanString(stackDisplay))
+	if plan.DetectedFramework != "" && plan.DetectedFramework != plan.Provider && plan.DetectedFramework != "custom" && plan.DetectedFramework != "compose" {
+		frameworkDisplay := plan.DetectedFramework
+		if plan.FrameworkVersion != "" {
+			frameworkDisplay = fmt.Sprintf("%s (v%s)", frameworkDisplay, plan.FrameworkVersion)
+		}
+		ui.Detail("Framework: %s", color.CyanString(frameworkDisplay))
+	}
+	ui.Detail("Engine:    %s", color.HiBlackString(plan.DetectionSource))
 	if plan.InstallCmd != "" {
 		ui.Detail("Install:   %s", color.HiBlackString(plan.InstallCmd))
 	}
@@ -148,19 +174,13 @@ func runUp(cmd *cobra.Command, args []string) error {
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
 	if plan.ComposeImage != "" {
-		// Compose-based deployment: pull the pre-built image from registry
-		ui.Detail("Pulling image from registry: %s", color.CyanString(plan.ComposeImage))
+		// Compose-based deployment: use the pre-built image from registry
+		imageTag = plan.ComposeImage
+		ui.Detail("Using pre-built registry image: %s", color.CyanString(plan.ComposeImage))
 		pullCmd := exec.CommandContext(ctx, "docker", "pull", plan.ComposeImage)
 		pullCmd.Stdout = os.Stdout
 		pullCmd.Stderr = os.Stderr
-		if err := pullCmd.Run(); err != nil {
-			return fmt.Errorf("docker pull failed: %w", err)
-		}
-		// Tag it with idlistack naming convention for minikube
-		tagCmd := exec.CommandContext(ctx, "docker", "tag", plan.ComposeImage, imageTag)
-		if err := tagCmd.Run(); err != nil {
-			return fmt.Errorf("docker tag failed: %w", err)
-		}
+		_ = pullCmd.Run()
 	} else if plan.DockerfilePath != "" {
 		// Use existing Dockerfile from the project
 		ui.Detail("Using existing Dockerfile: %s", color.HiBlackString(plan.DockerfilePath))
@@ -196,16 +216,28 @@ func runUp(cmd *cobra.Command, args []string) error {
 	}
 	ui.Detail("Image: %s", color.CyanString(imageTag))
 
-	// ─── Step 5: Load into Minikube ─────────────────────────────────
-	ui.Step(5, 6, "Loading image into Minikube")
+	// ─── Step 5: Load image into cluster ─────────────────────────────────
+	ui.Step(5, 6, "Loading image into cluster")
 
-	if err := loadIntoMinikube(ctx, imageTag); err != nil {
-		return fmt.Errorf("minikube image load failed: %w", err)
+	clusterRuntime, err := loadImageIntoCluster(ctx, imageTag)
+	if err != nil {
+		return fmt.Errorf("image load failed: %w", err)
 	}
-	ui.Detail("Image loaded into Minikube daemon")
+	runtimeName := "cluster"
+	switch clusterRuntime {
+	case RuntimeMinikube:
+		runtimeName = "minikube"
+	case RuntimeK3s:
+		runtimeName = "K3s containerd"
+	case RuntimeKind:
+		runtimeName = "kind"
+	case RuntimeDockerDesktop:
+		runtimeName = "Docker Desktop"
+	}
+	ui.Detail("Image loaded into %s", runtimeName)
 
-	// ─── Step 6: Deploy to Kubernetes ───────────────────────────────
-	ui.Step(6, 6, "Deploying to Kubernetes")
+	// ─── Step 6: Deploy to Kubernetes via Helm ───────────────────────────────
+	ui.Step(6, 6, "Deploying to Kubernetes via Helm")
 
 	deployer := k8s.NewDeployer(cfg, plan, imageTag, cwd)
 	url, err := deployer.Deploy(ctx, Verbose)
@@ -382,10 +414,15 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 
 	// Generate Dockerfile content - Multi-Stage Architecture
 	var df strings.Builder
+
+	workdir := "/app"
+	if plan.Provider == "php" {
+		workdir = "/var/www/html"
+	}
 	
 	// --- Stage 1: Builder ---
 	df.WriteString(fmt.Sprintf("FROM %s AS builder\n", baseImage))
-	df.WriteString("WORKDIR /app\n")
+	df.WriteString(fmt.Sprintf("WORKDIR %s\n", workdir))
 	df.WriteString("COPY . .\n")
 
 	// Pre-Install Command
@@ -408,18 +445,21 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 
 	// --- Stage 2: Runtime ---
 	df.WriteString(fmt.Sprintf("\nFROM %s\n", baseImage))
-	df.WriteString("WORKDIR /app\n")
+	df.WriteString(fmt.Sprintf("WORKDIR %s\n", workdir))
+
+	// Pre-Install Command (repeat in runtime stage for system dependencies)
+	if plan.PreInstallCmd != "" {
+		df.WriteString(fmt.Sprintf("RUN %s\n", plan.PreInstallCmd))
+	}
 
 	// Set User and change ownership
 	if plan.User != "" {
-		df.WriteString(fmt.Sprintf("RUN chown -R %s:%s /app\n", plan.User, plan.User))
+		df.WriteString(fmt.Sprintf("RUN chown -R %s:%s %s\n", plan.User, plan.User, workdir))
 		df.WriteString(fmt.Sprintf("USER %s\n", plan.User))
 	}
 
 	// Copy from builder
-	df.WriteString("COPY --from=builder /app .\n")
-
-
+	df.WriteString(fmt.Sprintf("COPY --from=builder %s %s\n", workdir, workdir))
 
 	// Add Environment Variables
 	if plan.Env != nil {
@@ -433,8 +473,10 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 		df.WriteString(fmt.Sprintf("EXPOSE %d\n", plan.Port))
 	}
 
-	// Add Start Command
-	if plan.StartCmd != "" {
+	// Add Start Command / Entrypoint
+	if plan.Provider == "php" && (plan.StartCmd == "/entrypoint.sh" || plan.StartCmd == "") {
+		df.WriteString("ENTRYPOINT [\"/entrypoint.sh\"]\n")
+	} else if plan.StartCmd != "" && !isPlaceholderCmd(plan.StartCmd) {
 		// Split start command for CMD array
 		parts := strings.Fields(plan.StartCmd)
 		cmdJSON, _ := json.Marshal(parts)
@@ -457,6 +499,14 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 
 	// Build using standard Docker build
 	return buildWithDockerfile(ctx, projectDir, tmpDockerfilePath, imageTag)
+}
+
+// isPlaceholderCmd detects placeholder start commands like "(defined in ghost image)"
+// or "(defined in Dockerfile)" — these mean the base image already has the correct
+// CMD, so we should NOT emit a CMD instruction in the generated Dockerfile.
+func isPlaceholderCmd(cmd string) bool {
+	trimmed := strings.TrimSpace(cmd)
+	return strings.HasPrefix(trimmed, "(") && strings.HasSuffix(trimmed, ")")
 }
 
 // resolveBaseImage determines the correct Docker base image from the build plan.
@@ -496,11 +546,13 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 		}
 		return fmt.Sprintf("ruby:%s-bookworm", version)
 	case "php":
-		version := "8" // Latest PHP 8.x
-		if plan.Runtime != "" {
+		version := "8.2" // Modern stable production PHP
+		if plan.Runtime != "" && plan.Runtime != "8" && plan.Runtime != "latest" && plan.Runtime != "lts" {
 			version = plan.Runtime
+		} else if plan.Runtime == "8" {
+			version = "8.2"
 		}
-		return fmt.Sprintf("php:%s-cli", version)
+		return fmt.Sprintf("php:%s-apache", version)
 	case "java":
 		version := "latest"
 		if plan.Runtime != "" {
@@ -531,11 +583,151 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 	}
 }
 
+// ClusterRuntime represents the detected Kubernetes cluster type
+type ClusterRuntime int
+
+const (
+	RuntimeUnknown ClusterRuntime = iota
+	RuntimeMinikube
+	RuntimeK3s
+	RuntimeKind
+	RuntimeDockerDesktop
+)
+
+// detectClusterRuntime dynamically detects what Kubernetes cluster is active
+// by inspecting the kubectl context and node metadata.
+func detectClusterRuntime(ctx context.Context) (ClusterRuntime, string) {
+	// 1. Check kubectl current-context name
+	ctxCmd := exec.CommandContext(ctx, "kubectl", "config", "current-context")
+	ctxOut, err := ctxCmd.Output()
+	if err == nil {
+		context := strings.TrimSpace(string(ctxOut))
+		if context == "minikube" || strings.HasPrefix(context, "minikube") {
+			return RuntimeMinikube, context
+		}
+		if strings.Contains(context, "k3s") || strings.Contains(context, "k3d") || context == "default" {
+			return RuntimeK3s, context
+		}
+		if strings.HasPrefix(context, "kind-") {
+			clusterName := strings.TrimPrefix(context, "kind-")
+			return RuntimeKind, clusterName
+		}
+		if context == "docker-desktop" {
+			return RuntimeDockerDesktop, context
+		}
+	}
+
+	// 2. Check node name/labels for more signal
+	nodeCmd := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", "jsonpath={.items[0].metadata.name}")
+	nodeOut, err := nodeCmd.Output()
+	if err == nil {
+		nodeName := strings.TrimSpace(string(nodeOut))
+		if nodeName == "minikube" {
+			return RuntimeMinikube, nodeName
+		}
+		if strings.HasPrefix(nodeName, "kind-") || strings.Contains(nodeName, "kind") {
+			return RuntimeKind, strings.TrimPrefix(strings.TrimSuffix(nodeName, "-control-plane"), "kind-")
+		}
+	}
+
+	// 3. Check if k3s is the active API server
+	if _, err := exec.LookPath("k3s"); err == nil {
+		checkCmd := exec.CommandContext(ctx, "k3s", "kubectl", "cluster-info")
+		if checkCmd.Run() == nil {
+			return RuntimeK3s, "default"
+		}
+	}
+
+	return RuntimeUnknown, ""
+}
+
+// loadImageIntoCluster dynamically detects the active Kubernetes cluster runtime
+// and loads the Docker image into it using the appropriate method.
+func loadImageIntoCluster(ctx context.Context, imageTag string) (ClusterRuntime, error) {
+	runtime, info := detectClusterRuntime(ctx)
+
+	switch runtime {
+	case RuntimeMinikube:
+		ui.Detail("Detected cluster: %s (minikube)", color.CyanString(info))
+		return runtime, loadIntoMinikube(ctx, imageTag)
+	case RuntimeK3s:
+		ui.Detail("Detected cluster: %s (K3s)", color.CyanString(info))
+		return runtime, loadIntoK3s(ctx, imageTag)
+	case RuntimeKind:
+		ui.Detail("Detected cluster: %s (kind)", color.CyanString(info))
+		return runtime, loadIntoKind(ctx, imageTag, info)
+	case RuntimeDockerDesktop:
+		ui.Detail("Detected cluster: Docker Desktop (images shared)")
+		// Docker Desktop shares the Docker daemon — no loading needed
+		return runtime, nil
+	default:
+		// Unknown cluster — try K3s first (it's our primary target),
+		// fall back to minikube if that fails
+		ui.Detail("Unknown cluster runtime, attempting K3s image import...")
+		if err := loadIntoK3s(ctx, imageTag); err != nil {
+			ui.Detail("K3s import failed, trying minikube...")
+			if err := loadIntoMinikube(ctx, imageTag); err != nil {
+				return runtime, fmt.Errorf("could not load image into any detected cluster runtime: %w", err)
+			}
+		}
+		return runtime, nil
+	}
+}
+
+func loadIntoK3s(ctx context.Context, imageTag string) error {
+	// If it's a pre-built public registry image, K3s containerd will pull it directly
+	if !strings.HasPrefix(imageTag, "idlistack/") {
+		ui.Detail("K3s containerd will use/pull %s directly", color.CyanString(imageTag))
+		return nil
+	}
+
+	tarPath := fmt.Sprintf("/tmp/idlistack-%d.tar", time.Now().UnixNano())
+	saveCmd := exec.CommandContext(ctx, "docker", "save", imageTag, "-o", tarPath)
+	saveCmd.Stdout = os.Stdout
+	saveCmd.Stderr = os.Stderr
+	if err := saveCmd.Run(); err != nil {
+		return fmt.Errorf("failed to save docker image: %w", err)
+	}
+	defer os.Remove(tarPath)
+
+	// Try without sudo first
+	directCmd := exec.CommandContext(ctx, "k3s", "ctr", "images", "import", tarPath)
+	if err := directCmd.Run(); err == nil {
+		return nil
+	}
+
+	// Try non-interactive sudo
+	sudoNCmd := exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "images", "import", tarPath)
+	if err := sudoNCmd.Run(); err == nil {
+		return nil
+	}
+
+	// Fallback to interactive sudo
+	importCmd := exec.CommandContext(ctx, "sudo", "k3s", "ctr", "images", "import", tarPath)
+	importCmd.Stdin = os.Stdin
+	importCmd.Stdout = os.Stdout
+	importCmd.Stderr = os.Stderr
+	return importCmd.Run()
+}
+
 func loadIntoMinikube(ctx context.Context, imageTag string) error {
-	cmd := exec.CommandContext(ctx, "minikube", "image", "load", imageTag)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+	// Use `minikube image load` which handles the transfer into minikube's
+	// Docker daemon running inside the VM/container.
+	loadCmd := exec.CommandContext(ctx, "minikube", "image", "load", imageTag)
+	loadCmd.Stdout = os.Stdout
+	loadCmd.Stderr = os.Stderr
+	return loadCmd.Run()
+}
+
+func loadIntoKind(ctx context.Context, imageTag string, clusterName string) error {
+	args := []string{"load", "docker-image", imageTag}
+	if clusterName != "" {
+		args = append(args, "--name", clusterName)
+	}
+	loadCmd := exec.CommandContext(ctx, "kind", args...)
+	loadCmd.Stdout = os.Stdout
+	loadCmd.Stderr = os.Stderr
+	return loadCmd.Run()
 }
 
 // zipDirectory creates a zip archive of the project (unused for now, for future remote upload)

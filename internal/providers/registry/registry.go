@@ -18,6 +18,7 @@ import (
 	"github.com/idlistack/cli/internal/providers/rust"
 	"github.com/idlistack/cli/internal/providers/shell"
 	"github.com/idlistack/cli/internal/providers/staticfile"
+	"github.com/idlistack/cli/internal/providers/whatomate"
 )
 
 // GetProviders returns all language providers in detection order.
@@ -37,6 +38,7 @@ import (
 //   12. Shell   — Universal fallback
 func GetProviders() []provider.Provider {
 	return []provider.Provider{
+		&whatomate.WhatomateProvider{},
 		&php.PhpProvider{},
 		&golang.GoProvider{},
 		&java.JavaProvider{},

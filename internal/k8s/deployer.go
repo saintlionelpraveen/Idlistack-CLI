@@ -2,10 +2,13 @@ package k8s
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"syscall"
 	"time"
@@ -74,14 +77,19 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	}
 	defer releaseLock(lockFile, lockPath)
 
+	// ─── Initialize Helm Directory ──────────────────────────────────
+	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
+	os.RemoveAll(helmDir)
+	os.MkdirAll(filepath.Join(helmDir, "templates"), 0755)
+
+	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\ndescription: Idlistack App\nversion: 0.1.0\nappVersion: 1.0.0\n", d.appName)
+	os.WriteFile(filepath.Join(helmDir, "Chart.yaml"), []byte(chartYaml), 0644)
+
 	// ─── Clean up previous failed deployments ───────────────────────
 	d.cleanupOldDeployment(ctx)
 
 	// ─── Namespace Manager ──────────────────────────────────────────
-	ui.Detail("Creating namespace: %s", d.namespace)
-	if err := d.ensureNamespace(ctx); err != nil {
-		return "", fmt.Errorf("namespace creation failed: %w", err)
-	}
+	// Helm manages namespace creation with --create-namespace
 
 	// ─── Ensure Dependency Services (Postgres, Redis, etc.) ─────────
 	if err := d.ensureDependencies(ctx); err != nil {
@@ -90,7 +98,7 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 
 	// ─── Pre-deploy jobs ────────────────────────────────────────────
 	if d.plan.PreDeployCmd != "" {
-		ui.Detail("Running pre-deploy: %s", d.plan.PreDeployCmd)
+		ui.Detail("Scaffolding pre-deploy job: %s", d.plan.PreDeployCmd)
 		if err := d.runPreDeploy(ctx); err != nil {
 			return "", fmt.Errorf("pre-deploy failed: %w", err)
 		}
@@ -100,15 +108,15 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	secretName := fmt.Sprintf("%s-env", d.appName)
 	hasSecrets := d.checkSecretsExist(ctx, secretName)
 
-	// ─── Generate and apply manifests ───────────────────────────────
-	ui.Detail("Applying Kubernetes manifests")
+	// ─── Generate manifests ─────────────────────────────────────────
+	ui.Detail("Generating Helm templates")
 	if err := d.applyManifests(ctx, hasSecrets, secretName); err != nil {
-		return "", fmt.Errorf("manifest apply failed: %w", err)
+		return "", fmt.Errorf("manifest generation failed: %w", err)
 	}
 
-	// ─── Rollout Status ─────────────────────────────────────────────
-	ui.Detail("Waiting for rollout to complete...")
-	if err := d.waitForRollout(ctx); err != nil {
+	// ─── Helm Deploy ────────────────────────────────────────────────
+	ui.Detail("Deploying via Helm (waiting for rollout to complete...)")
+	if err := d.executeHelmDeploy(ctx); err != nil {
 		// Show pod logs before rollback so user can see the crash reason
 		ui.Warn("Deployment failed, fetching pod logs for debugging...")
 		d.showPodLogs(ctx)
@@ -116,6 +124,11 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 		ui.Warn("Attempting rollback...")
 		d.rollback(ctx)
 		return "", fmt.Errorf("deployment failed (rolled back): %w", err)
+	}
+
+	// ─── Auto-Migrate Local Data (if applicable) ────────────────────
+	if d.appName == "w1" || d.appName == "whatomate" || strings.Contains(d.projectDir, "whatomate") {
+		d.syncLocalDockerData(ctx)
 	}
 
 	// ─── Get URL ────────────────────────────────────────────────────
@@ -127,16 +140,8 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 // ─── Namespace ──────────────────────────────────────────────────────────
 
 func (d *Deployer) ensureNamespace(ctx context.Context) error {
-	manifest := fmt.Sprintf(`apiVersion: v1
-kind: Namespace
-metadata:
-  name: %s
-  labels:
-    managed-by: idlistack
-    project: %s
-`, d.namespace, d.appName)
-
-	return applyManifest(ctx, manifest)
+	// Let Helm handle namespace creation
+	return nil
 }
 
 // ─── Manifests ──────────────────────────────────────────────────────────
@@ -152,104 +157,10 @@ func (d *Deployer) applyManifests(ctx context.Context, hasSecrets bool, secretNa
 		port = d.config.Deploy.Port
 	}
 
-	// ─── Deployment manifest ────────────────────────────────────────
-	envFromSection := ""
-	if hasSecrets {
-		envFromSection = fmt.Sprintf(`
-          envFrom:
-          - secretRef:
-              name: %s`, secretName)
-	}
-
-	// Generate inline env vars from plan (e.g. from docker-compose.yml)
-	envSection := ""
-	if len(d.plan.Env) > 0 {
-		envSection = "\n        env:"
-		for k, v := range d.plan.Env {
-			envSection += fmt.Sprintf("\n        - name: %s\n          value: \"%s\"", k, v)
-		}
-	}
-
-	// Use TCP socket probes instead of HTTP — works for ALL apps
-	// regardless of whether they have a /health endpoint.
-	// startupProbe gives the app up to 150s (30 * 5s) to boot before
-	// liveness/readiness probes kick in.
-	deploymentManifest := fmt.Sprintf(`apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: %s
-  namespace: %s
-  labels:
-    app: %s
-    managed-by: idlistack
-spec:
-  replicas: %d
-  revisionHistoryLimit: 3
-  selector:
-    matchLabels:
-      app: %s
-  template:
-    metadata:
-      labels:
-        app: %s
-    spec:
-      containers:
-      - name: %s
-        image: %s
-        imagePullPolicy: Never
-        ports:
-        - containerPort: %d
-        resources:
-          requests:
-            memory: "%s"
-            cpu: "%s"
-          limits:
-            memory: "%s"
-            cpu: "%s"
-        startupProbe:
-          tcpSocket:
-            port: %d
-          initialDelaySeconds: 5
-          periodSeconds: 5
-          failureThreshold: 30
-          timeoutSeconds: 3
-        livenessProbe:
-          tcpSocket:
-            port: %d
-          initialDelaySeconds: 0
-          periodSeconds: 15
-          failureThreshold: 3
-          timeoutSeconds: 3
-        readinessProbe:
-          tcpSocket:
-            port: %d
-          initialDelaySeconds: 0
-          periodSeconds: 5
-          failureThreshold: 3
-          timeoutSeconds: 3%s%s
-      securityContext:
-        runAsNonRoot: false
-`,
-		d.appName, d.namespace,
-		d.appName,
-		replicas,
-		d.appName,
-		d.appName,
-		d.appName,
-		d.imageTag,
-		port,
-		d.plan.Resources.Memory, d.plan.Resources.CPU,
-		d.plan.Resources.Memory, d.plan.Resources.CPU,
-		port,
-		port,
-		port,
-		envFromSection,
-		envSection,
-	)
-
-	if err := applyManifest(ctx, deploymentManifest); err != nil {
-		return fmt.Errorf("deployment apply failed: %w", err)
-	}
+	// ─── Deterministic NodePort & URL Pre-allocation ────────────────
+	nodePort := d.allocateNodePort(ctx)
+	nodeIp := d.getNodeIP(ctx)
+	appUrl := fmt.Sprintf("http://%s:%d", nodeIp, nodePort)
 
 	// ─── Service manifest ───────────────────────────────────────────
 	serviceManifest := fmt.Sprintf(`apiVersion: v1
@@ -268,15 +179,305 @@ spec:
   - protocol: TCP
     port: %d
     targetPort: %d
+    nodePort: %d
 `,
 		d.appName, d.namespace,
 		d.appName,
 		d.appName,
-		port, port,
+		port, port, nodePort,
 	)
 
-	if err := applyManifest(ctx, serviceManifest); err != nil {
-		return fmt.Errorf("service apply failed: %w", err)
+	if err := d.writeManifest("service", serviceManifest); err != nil {
+		return fmt.Errorf("service template failed: %w", err)
+	}
+
+	// ─── Deployment manifest ────────────────────────────────────────
+	envFromSection := ""
+	if hasSecrets {
+		envFromSection = fmt.Sprintf(`
+          envFrom:
+          - secretRef:
+              name: %s`, secretName)
+	}
+
+	// Generate inline env vars from plan and provisioned dependencies
+	envSection := ""
+	dbUser, dbPass, dbName := d.extractDbCredentials()
+
+	containerEnv := make(map[string]string)
+	containerEnv["APP_URL"] = appUrl
+	containerEnv["DB_HOST"] = "db"
+	containerEnv["DB_PORT"] = "3306"
+	containerEnv["DB_USER"] = dbUser
+	containerEnv["DB_PASS"] = dbPass
+	containerEnv["DB_PASSWORD"] = dbPass
+	containerEnv["DB_NAME"] = dbName
+	containerEnv["MYSQL_HOST"] = "db"
+	containerEnv["MYSQL_PORT"] = "3306"
+	containerEnv["MYSQL_USER"] = dbUser
+	containerEnv["MYSQL_PASSWORD"] = dbPass
+	containerEnv["MYSQL_DATABASE"] = dbName
+
+	cleanAppUrl := strings.TrimSuffix(appUrl, "/")
+	localhostRegex := regexp.MustCompile(`https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(/?)`)
+
+	for k, v := range d.plan.Env {
+		v = strings.ReplaceAll(v, "{{DB_USER}}", dbUser)
+		v = strings.ReplaceAll(v, "{{DB_PASS}}", dbPass)
+		v = strings.ReplaceAll(v, "{{DB_NAME}}", dbName)
+		v = strings.ReplaceAll(v, "{{DB_HOST}}", "db")
+		v = strings.ReplaceAll(v, "{{DB_PORT}}", "3306")
+		v = strings.ReplaceAll(v, "{{APP_URL}}", appUrl)
+
+		// Dynamically replace hardcoded localhost / 127.0.0.1 URLs with real NodePort appUrl
+		v = localhostRegex.ReplaceAllStringFunc(v, func(match string) string {
+			if strings.HasSuffix(match, "/") {
+				return cleanAppUrl + "/"
+			}
+			return cleanAppUrl
+		})
+
+		containerEnv[k] = v
+	}
+
+	if len(containerEnv) > 0 {
+		envSection = "\n        env:"
+		for k, v := range containerEnv {
+			envSection += fmt.Sprintf("\n        - name: %s\n          value: \"%s\"", k, v)
+		}
+	}
+
+	// ─── Generate volume mounts and volumes ─────────────────────────
+	type volumeDef struct {
+		Name      string
+		MountPath string
+		HostPath  string
+		IsPVC     bool
+	}
+
+	var volDefs []volumeDef
+	seenMounts := make(map[string]bool)
+
+	// 1. Process d.plan.ComposeVolumes (e.g. "./files:/app/vikunja/files", "./db:/db")
+	for _, cv := range d.plan.ComposeVolumes {
+		cv = strings.TrimSpace(cv)
+		if cv == "" {
+			continue
+		}
+		parts := strings.Split(cv, ":")
+		var hostPart, containerPart string
+		if len(parts) == 1 {
+			containerPart = parts[0]
+		} else {
+			hostPart = parts[0]
+			containerPart = parts[1]
+		}
+		containerPart = filepath.Clean(containerPart)
+		if seenMounts[containerPart] {
+			continue
+		}
+		seenMounts[containerPart] = true
+
+		idx := len(volDefs)
+		volName := fmt.Sprintf("data-%d", idx)
+
+		var absHost string
+		isHost := false
+		if hostPart != "" {
+			if strings.HasPrefix(hostPart, ".") || strings.HasPrefix(hostPart, "/") || strings.HasPrefix(hostPart, "~") {
+				isHost = true
+				if strings.HasPrefix(hostPart, "~") {
+					home, _ := os.UserHomeDir()
+					absHost = filepath.Join(home, strings.TrimPrefix(hostPart, "~"))
+				} else if filepath.IsAbs(hostPart) {
+					absHost = filepath.Clean(hostPart)
+				} else {
+					absHost = filepath.Clean(filepath.Join(d.projectDir, hostPart))
+				}
+				_ = os.MkdirAll(absHost, 0777)
+			}
+		}
+
+		volDefs = append(volDefs, volumeDef{
+			Name:      volName,
+			MountPath: containerPart,
+			HostPath:  absHost,
+			IsPVC:     !isHost,
+		})
+	}
+
+	// 2. Process d.plan.Volumes (e.g. from Ghost or other detected plans)
+	for _, v := range d.plan.Volumes {
+		v = strings.TrimSpace(v)
+		if v == "" {
+			continue
+		}
+		cleanV := filepath.Clean(v)
+		if seenMounts[cleanV] {
+			continue
+		}
+		seenMounts[cleanV] = true
+
+		idx := len(volDefs)
+		volName := fmt.Sprintf("data-%d", idx)
+		volDefs = append(volDefs, volumeDef{
+			Name:      volName,
+			MountPath: cleanV,
+			IsPVC:     true,
+		})
+	}
+
+	volumeMountsSection := ""
+	volumesSection := ""
+	pvcManifests := ""
+	initContainersSection := ""
+
+	if len(volDefs) > 0 {
+		var vMounts strings.Builder
+		vMounts.WriteString("\n        volumeMounts:")
+		for _, vd := range volDefs {
+			vMounts.WriteString(fmt.Sprintf("\n        - name: %s\n          mountPath: %s", vd.Name, vd.MountPath))
+		}
+		volumeMountsSection = vMounts.String()
+
+		var vList strings.Builder
+		vList.WriteString("\n      volumes:")
+		for _, vd := range volDefs {
+			if vd.HostPath != "" {
+				vList.WriteString(fmt.Sprintf(`
+      - name: %s
+        hostPath:
+          path: %s
+          type: DirectoryOrCreate`, vd.Name, vd.HostPath))
+			} else {
+				claimName := fmt.Sprintf("%s-%s", d.appName, vd.Name)
+				vList.WriteString(fmt.Sprintf(`
+      - name: %s
+        persistentVolumeClaim:
+          claimName: %s`, vd.Name, claimName))
+				pvcManifests += fmt.Sprintf(`---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: %s
+  namespace: %s
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+`, claimName, d.namespace)
+			}
+		}
+		volumesSection = vList.String()
+
+		// InitContainer to guarantee file permissions for non-root containers (UID 1000, 33, 999, etc.)
+		var initMounts strings.Builder
+		var targetPaths []string
+		for _, vd := range volDefs {
+			initMounts.WriteString(fmt.Sprintf("\n        - name: %s\n          mountPath: %s", vd.Name, vd.MountPath))
+			targetPaths = append(targetPaths, vd.MountPath)
+		}
+
+		pathsArg := strings.Join(targetPaths, " ")
+		initContainersSection = fmt.Sprintf(`
+      initContainers:
+      - name: init-volume-permissions
+        image: busybox:1.36
+        imagePullPolicy: IfNotPresent
+        command: ["sh", "-c", "chmod -R 777 %[1]s 2>/dev/null || true; chown -R 1000:1000 %[1]s 2>/dev/null || true"]
+        volumeMounts:%[2]s`, pathsArg, initMounts.String())
+	}
+
+	// Use TCP socket probes instead of HTTP — works for ALL apps
+	// regardless of whether they have a /health endpoint.
+	// startupProbe gives the app up to 150s (30 * 5s) to boot before
+	// liveness/readiness probes kick in. Helm timeout (300s) is set
+	// to exceed this window to avoid deadline race conditions.
+	deploymentManifest := fmt.Sprintf(`apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: %[1]s
+  namespace: %[2]s
+  labels:
+    app: %[1]s
+    managed-by: idlistack
+spec:
+  replicas: %[3]d
+  revisionHistoryLimit: 3
+  selector:
+    matchLabels:
+      app: %[1]s
+  template:
+    metadata:
+      labels:
+        app: %[1]s
+    spec:
+      securityContext:
+        runAsNonRoot: false
+        fsGroup: 1000
+        fsGroupChangePolicy: Always%[14]s
+      containers:
+      - name: %[1]s
+        image: %[4]s
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: %[5]d
+        resources:
+          requests:
+            memory: "%[6]s"
+            cpu: "%[7]s"
+          limits:
+            memory: "%[8]s"
+            cpu: "%[9]s"
+        startupProbe:
+          tcpSocket:
+            port: %[5]d
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 30
+          timeoutSeconds: 3
+        livenessProbe:
+          tcpSocket:
+            port: %[5]d
+          initialDelaySeconds: 0
+          periodSeconds: 15
+          failureThreshold: 3
+          timeoutSeconds: 3
+        readinessProbe:
+          tcpSocket:
+            port: %[5]d
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          failureThreshold: 3
+          timeoutSeconds: 3%[10]s%[11]s%[12]s%[13]s
+`,
+		d.appName,                   // 1
+		d.namespace,                 // 2
+		replicas,                    // 3
+		d.imageTag,                  // 4
+		port,                        // 5
+		d.plan.Resources.Memory,     // 6
+		d.plan.Resources.CPU,        // 7
+		d.plan.Resources.Memory,     // 8
+		d.plan.Resources.CPU,        // 9
+		envFromSection,              // 10
+		envSection,                  // 11
+		volumeMountsSection,         // 12
+		volumesSection,              // 13
+		initContainersSection,       // 14
+	)
+
+	if err := d.writeManifest("deployment", deploymentManifest); err != nil {
+		return fmt.Errorf("deployment template failed: %w", err)
+	}
+
+	// Write PVC manifests for persistent volumes
+	if pvcManifests != "" {
+		if err := d.writeManifest("persistent-volumes", pvcManifests); err != nil {
+			return fmt.Errorf("persistent volume template failed: %w", err)
+		}
 	}
 
 	return nil
@@ -290,6 +491,9 @@ kind: Job
 metadata:
   name: %s-predeploy
   namespace: %s
+  annotations:
+    "helm.sh/hook": pre-install,pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
 spec:
   backoffLimit: 1
   ttlSecondsAfterFinished: 300
@@ -298,54 +502,108 @@ spec:
       containers:
       - name: predeploy
         image: %s
-        imagePullPolicy: Never
+        imagePullPolicy: IfNotPresent
         command: ["/bin/sh", "-c", "%s"]
       restartPolicy: Never
 `, d.appName, d.namespace, d.imageTag, d.plan.PreDeployCmd)
 
-	// Delete old job if exists
-	exec.CommandContext(ctx, "kubectl", "delete", "job",
-		fmt.Sprintf("%s-predeploy", d.appName),
-		"-n", d.namespace, "--ignore-not-found").Run()
-
-	if err := applyManifest(ctx, jobManifest); err != nil {
-		return err
-	}
-
-	// Wait for job completion
-	waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=complete",
-		fmt.Sprintf("job/%s-predeploy", d.appName),
-		"-n", d.namespace, "--timeout=300s")
-	return waitCmd.Run()
+	return d.writeManifest("job-predeploy", jobManifest)
 }
 
 // ─── Rollout ────────────────────────────────────────────────────────────
 
-func (d *Deployer) waitForRollout(ctx context.Context) error {
-	cmd := exec.CommandContext(ctx, "kubectl", "rollout", "status",
-		fmt.Sprintf("deployment/%s", d.appName),
-		"-n", d.namespace, "--timeout=300s")
+func (d *Deployer) executeHelmDeploy(ctx context.Context) error {
+	helmDir := filepath.Join(d.projectDir, ".idlistack", "helm")
+
+	// Helm timeout must exceed the startup probe window + buffer.
+	// startupProbe: failureThreshold(30) * periodSeconds(5) = 150s
+	// Buffer: 150s → total 300s. This prevents the race condition where
+	// Helm's deadline fires before Kubernetes finishes probing.
+	helmTimeout := "300s"
+
+	cmd := exec.CommandContext(ctx, "helm", "upgrade", "--install", d.appName, helmDir,
+		"--namespace", d.namespace,
+		"--create-namespace",
+		"--wait", "--timeout", helmTimeout,
+		"--atomic") // auto-rollback on failure; auto-purge on failed first install
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 	return cmd.Run()
 }
 
 func (d *Deployer) rollback(ctx context.Context) {
-	cmd := exec.CommandContext(ctx, "kubectl", "rollout", "undo",
-		fmt.Sprintf("deployment/%s", d.appName),
-		"-n", d.namespace)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	cmd.Run()
+	// Check if there's a prior revision to roll back to.
+	// On a first-install failure, there's no revision 0 — helm rollback
+	// would fail with "release has no 0 version". Use uninstall instead.
+	histCmd := exec.CommandContext(ctx, "helm", "history", d.appName,
+		"-n", d.namespace, "--max", "2", "-o", "json")
+	output, _ := histCmd.Output()
+
+	// Count deployed revisions (not pending/failed ones)
+	hasDeployedRevision := false
+	if len(output) > 2 {
+		var history []struct {
+			Status string `json:"status"`
+		}
+		if err := json.Unmarshal(output, &history); err == nil {
+			for _, h := range history {
+				if h.Status == "deployed" || h.Status == "superseded" {
+					hasDeployedRevision = true
+					break
+				}
+			}
+		}
+	}
+
+	if hasDeployedRevision {
+		cmd := exec.CommandContext(ctx, "helm", "rollback", d.appName, "-n", d.namespace)
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run()
+	} else {
+		// First install failed — no prior revision to roll back to.
+		// Purge the failed release so the next deploy starts clean.
+		ui.Warn("No previous successful revision — uninstalling failed release...")
+		cmd := exec.CommandContext(ctx, "helm", "uninstall", d.appName,
+			"-n", d.namespace, "--no-hooks")
+		cmd.Stdout = os.Stdout
+		cmd.Stderr = os.Stderr
+		cmd.Run()
+	}
 }
 
-// cleanupOldDeployment removes old crashed pods before a fresh deploy
 func (d *Deployer) cleanupOldDeployment(ctx context.Context) {
-	// Delete the old deployment and pods (but keep the namespace)
-	exec.CommandContext(ctx, "kubectl", "delete", "deployment",
-		d.appName, "-n", d.namespace, "--ignore-not-found").Run()
-	// Brief pause to let Kubernetes process the deletion
-	time.Sleep(2 * time.Second)
+	// Check if a previous failed/pending-install release exists.
+	// Helm does NOT natively clean up zombie releases in pending-install
+	// or pending-upgrade state — they block all future deploys.
+	cmd := exec.CommandContext(ctx, "helm", "status", d.appName,
+		"-n", d.namespace, "-o", "json")
+	output, err := cmd.Output()
+	if err != nil {
+		return // No existing release — clean slate
+	}
+
+	var status struct {
+		Info struct {
+			Status string `json:"status"`
+		} `json:"info"`
+	}
+	if err := json.Unmarshal(output, &status); err != nil {
+		return
+	}
+
+	// Purge zombie releases that block helm upgrade --install
+	s := status.Info.Status
+	if s == "pending-install" || s == "pending-upgrade" || s == "failed" {
+		ui.Warn(fmt.Sprintf("Cleaning up stuck release (status: %s)...", s))
+		uninstallCmd := exec.CommandContext(ctx, "helm", "uninstall", d.appName,
+			"-n", d.namespace, "--no-hooks")
+		uninstallCmd.Stdout = os.Stdout
+		uninstallCmd.Stderr = os.Stderr
+		uninstallCmd.Run()
+		// Brief wait for Helm to finish cleanup
+		time.Sleep(2 * time.Second)
+	}
 }
 
 // showPodLogs fetches and prints the last 30 lines of logs from the crashing pod
@@ -361,17 +619,78 @@ func (d *Deployer) showPodLogs(ctx context.Context) {
 	}
 }
 
-// ─── Service URL ────────────────────────────────────────────────────────
+// ─── Service URL & NodePort Resolution ───────────────────────────────────
 
 func (d *Deployer) getServiceURL(ctx context.Context) string {
-	// Try minikube service url
-	cmd := exec.CommandContext(ctx, "minikube", "service",
-		d.appName, "-n", d.namespace, "--url")
-	output, err := cmd.Output()
+	// 1. Get NodePort
+	cmd := exec.CommandContext(ctx, "kubectl", "get", "svc", d.appName, "-n", d.namespace, "-o", "jsonpath={.spec.ports[0].nodePort}")
+	out, err := cmd.Output()
+	var nodePort string
 	if err == nil {
-		return strings.TrimSpace(string(output))
+		nodePort = strings.TrimSpace(string(out))
 	}
-	return ""
+	if nodePort == "" {
+		nodePort = fmt.Sprintf("%d", d.allocateNodePort(ctx))
+	}
+
+	// 2. Get K3s Node IP
+	nodeIp := d.getNodeIP(ctx)
+
+	return fmt.Sprintf("http://%s:%s", nodeIp, nodePort)
+}
+
+func (d *Deployer) getNodeIP(ctx context.Context) string {
+	cmdIp := exec.CommandContext(ctx, "kubectl", "get", "nodes", "-o", `jsonpath={.items[0].status.addresses[?(@.type=="InternalIP")].address}`)
+	outIp, err := cmdIp.Output()
+	if err != nil {
+		return "127.0.0.1"
+	}
+	nodeIp := strings.TrimSpace(string(outIp))
+	if nodeIp == "" {
+		return "127.0.0.1"
+	}
+	return strings.Fields(nodeIp)[0]
+}
+
+func (d *Deployer) allocateNodePort(ctx context.Context) int {
+	// 1. Check if the service already exists in this namespace
+	cmdExisting := exec.CommandContext(ctx, "kubectl", "get", "svc", d.appName, "-n", d.namespace, "-o", "jsonpath={.spec.ports[0].nodePort}")
+	if out, err := cmdExisting.Output(); err == nil {
+		var port int
+		if _, err := fmt.Sscanf(strings.TrimSpace(string(out)), "%d", &port); err == nil && port >= 30000 && port <= 32767 {
+			return port
+		}
+	}
+
+	// 2. Query all currently used NodePorts across all namespaces
+	cmdUsed := exec.CommandContext(ctx, "kubectl", "get", "svc", "-A", "-o", "jsonpath={.items[*].spec.ports[*].nodePort}")
+	usedPorts := make(map[int]bool)
+	if out, err := cmdUsed.Output(); err == nil {
+		for _, field := range strings.Fields(string(out)) {
+			var p int
+			if _, err := fmt.Sscanf(field, "%d", &p); err == nil && p > 0 {
+				usedPorts[p] = true
+			}
+		}
+	}
+
+	// 3. Deterministic starting offset based on appName hash to avoid port collisions
+	h := fnv.New32a()
+	h.Write([]byte(d.appName))
+	offset := int(h.Sum32() % 2000)
+	basePort := 30500 + offset
+
+	for port := basePort; port <= 32767; port++ {
+		if !usedPorts[port] {
+			return port
+		}
+	}
+	for port := 30000; port < basePort; port++ {
+		if !usedPorts[port] {
+			return port
+		}
+	}
+	return 30000
 }
 
 // ─── Secrets ────────────────────────────────────────────────────────────
@@ -412,18 +731,56 @@ func releaseLock(f *os.File, path string) {
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
-func applyManifest(ctx context.Context, manifest string) error {
-	cmd := exec.CommandContext(ctx, "kubectl", "apply", "-f", "-")
-	cmd.Stdin = strings.NewReader(manifest)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
+func (d *Deployer) writeManifest(name, manifest string) error {
+	path := filepath.Join(d.projectDir, ".idlistack", "helm", "templates", name+".yaml")
+	return os.WriteFile(path, []byte(manifest), 0644)
 }
 
 func (d *Deployer) extractDbCredentials() (user, pass, dbname string) {
 	user = d.appName
 	pass = d.appName
 	dbname = d.appName
+
+	// Try Frappe site_config.json if it exists
+	if b, err := os.ReadFile(filepath.Join(d.projectDir, "sites", "currentsite.txt")); err == nil {
+		siteName := strings.TrimSpace(string(b))
+		if b, err := os.ReadFile(filepath.Join(d.projectDir, "sites", siteName, "site_config.json")); err == nil {
+			type siteConfig struct {
+				DbName     string `json:"db_name"`
+				DbPassword string `json:"db_password"`
+			}
+			var sc siteConfig
+			if err := json.Unmarshal(b, &sc); err == nil {
+				if sc.DbName != "" {
+					dbname = sc.DbName
+					user = sc.DbName
+				}
+				if sc.DbPassword != "" {
+					pass = sc.DbPassword
+				}
+			}
+		}
+	}
+
+	if d.plan != nil && d.plan.Env != nil {
+		for k, v := range d.plan.Env {
+			if strings.Contains(v, "{{") {
+				continue
+			}
+			lower := strings.ToLower(k)
+			if strings.Contains(lower, "user") {
+				user = v
+			}
+			if strings.Contains(lower, "password") || strings.Contains(lower, "pass") {
+				pass = v
+			}
+			if strings.Contains(lower, "database") || strings.Contains(lower, "db") {
+				if v != "mysql" && v != "postgres" && v != "db" && v != "localhost" && !strings.Contains(lower, "client") && !strings.Contains(lower, "host") {
+					dbname = v
+				}
+			}
+		}
+	}
 
 	files := []string{"config.toml", "config.example.toml", ".env", ".env.example", ".env.local"}
 	for _, fname := range files {
@@ -490,21 +847,37 @@ func (d *Deployer) ensureDependencies(ctx context.Context) error {
 		allDeps = append(allDeps, d.plan.Dependencies...)
 	}
 
+	var mysqlImage string
+	var mysqlCommand string
+
 	if len(allDeps) > 0 {
 		for _, dep := range allDeps {
-			depLower := strings.ToLower(dep)
-			if depLower == "postgres" || depLower == "postgresql" || depLower == "db" {
+			parts := strings.Split(dep, " ")
+			base := strings.ToLower(parts[0])
+			if strings.HasPrefix(base, "postgres") || base == "db" {
 				needsPostgres = true
 			}
-			if depLower == "redis" {
+			if strings.HasPrefix(base, "redis") {
 				needsRedis = true
 			}
-			if depLower == "mysql" || depLower == "mariadb" {
+			if strings.HasPrefix(base, "mysql") || strings.HasPrefix(base, "mariadb") {
 				needsMysql = true
+				mysqlImage = parts[0]
+				if len(parts) > 1 {
+					var cmdArgs []string
+					for _, arg := range parts[1:] {
+						cmdArgs = append(cmdArgs, fmt.Sprintf("        - %s", arg))
+					}
+					mysqlCommand = fmt.Sprintf("args:\n        - mysqld\n%s", strings.Join(cmdArgs, "\n"))
+				}
 			}
 		}
 	} else {
-		filesToScan := []string{"docker-compose.yml", "docker-compose.yaml", "config.toml", "config.example.toml", ".env", ".env.example", "idlistack.toml"}
+		sqlFiles, _ := filepath.Glob(filepath.Join(d.projectDir, "*.sql"))
+		if len(sqlFiles) > 0 {
+			needsMysql = true
+		}
+		filesToScan := []string{"docker-compose.yml", "docker-compose.yaml", "config.toml", "config.example.toml", ".env", ".env.example", "idlistack.toml", "config/config.php", "config.php", "wp-config.php"}
 		for _, fname := range filesToScan {
 			fpath := filepath.Join(d.projectDir, fname)
 			content, err := os.ReadFile(fpath)
@@ -517,6 +890,9 @@ func (d *Deployer) ensureDependencies(ctx context.Context) error {
 			}
 			if strings.Contains(str, "redis") || strings.Contains(str, "host = \"redis\"") || strings.Contains(str, "host=\"redis\"") || strings.Contains(str, "redis:6379") || strings.Contains(str, "6379") {
 				needsRedis = true
+			}
+			if strings.Contains(str, "mysql") || strings.Contains(str, "mariadb") || strings.Contains(str, "mysqli") || strings.Contains(str, "pdo_mysql") || strings.Contains(str, "3306") {
+				needsMysql = true
 			}
 		}
 	}
@@ -602,16 +978,64 @@ spec:
   - port: 5432
     targetPort: 5432
 `, d.namespace, dbUser, dbPass, dbName)
-		_ = applyManifest(ctx, postgresManifest)
-		ui.Detail("Waiting for Postgres database to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
-		if err := waitCmd.Run(); err != nil {
-			return fmt.Errorf("Postgres failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
-		}
+		_ = d.writeManifest("dependency-postgres", postgresManifest)
 	}
 
 	if needsMysql {
-		ui.Detail("Provisioning dependency: %s (db: %s, user: %s)", color.CyanString("MySQL (db)"), dbName, dbUser)
+		ui.Detail("Provisioning dependency: %s (db: %s, user: %s)", color.CyanString("MariaDB/MySQL (db)"), dbName, dbUser)
+		if mysqlImage == "" || mysqlImage == "mysql" {
+			mysqlImage = "mariadb:10.6" // MariaDB is fast, stable, and uses lower memory
+		} else if mysqlImage == "mariadb" {
+			mysqlImage = "mariadb:10.6"
+		}
+
+		var commandInjection string
+		if mysqlCommand != "" {
+			commandInjection = fmt.Sprintf("        %s", strings.TrimSpace(mysqlCommand))
+		}
+
+		// Check for database initialization SQL file (e.g. database.sql)
+		var sqlInitMount string
+		var sqlInitVolume string
+		var sqlConfigMap string
+
+		sqlCandidate := filepath.Join(d.projectDir, "database.sql")
+		if _, err := os.Stat(sqlCandidate); err != nil {
+			sqls, _ := filepath.Glob(filepath.Join(d.projectDir, "*.sql"))
+			if len(sqls) > 0 {
+				sqlCandidate = sqls[0]
+			} else {
+				sqlCandidate = ""
+			}
+		}
+
+		if sqlCandidate != "" {
+			if sqlBytes, err := os.ReadFile(sqlCandidate); err == nil && len(sqlBytes) > 0 {
+				var indented strings.Builder
+				for _, line := range strings.Split(string(sqlBytes), "\n") {
+					indented.WriteString("    " + line + "\n")
+				}
+				sqlConfigMap = fmt.Sprintf(`---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: db-init-sql
+  namespace: %s
+data:
+  init.sql: |
+%s`, d.namespace, indented.String())
+
+				sqlInitMount = `
+        - name: db-init
+          mountPath: /docker-entrypoint-initdb.d/init.sql
+          subPath: init.sql`
+				sqlInitVolume = `
+      - name: db-init
+        configMap:
+          name: db-init-sql`
+			}
+		}
+
 		mysqlManifest := fmt.Sprintf(`apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -629,7 +1053,8 @@ spec:
     spec:
       containers:
       - name: mysql
-        image: mysql:8.0
+        image: %[5]s
+%[6]s
         imagePullPolicy: IfNotPresent
         env:
         - name: MYSQL_USER
@@ -642,18 +1067,32 @@ spec:
           value: "%[3]s"
         ports:
         - containerPort: 3306
+        startupProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          failureThreshold: 30
+          timeoutSeconds: 3
         readinessProbe:
           exec:
-            command: ["mysqladmin", "ping", "-h", "localhost", "-u", "root", "-p%[3]s"]
-          initialDelaySeconds: 10
+            command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]
+          initialDelaySeconds: 5
           periodSeconds: 5
+          timeoutSeconds: 3
+        livenessProbe:
+          exec:
+            command: ["mysqladmin", "ping", "-h", "127.0.0.1", "-u", "root", "-p%[3]s"]
+          initialDelaySeconds: 30
+          periodSeconds: 15
+          timeoutSeconds: 3
         volumeMounts:
         - name: db-data
-          mountPath: /var/lib/mysql
+          mountPath: /var/lib/mysql%[7]s
       volumes:
       - name: db-data
         persistentVolumeClaim:
-          claimName: db-pvc
+          claimName: db-pvc%[8]s
 ---
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -690,13 +1129,9 @@ spec:
   ports:
   - port: 3306
     targetPort: 3306
-`, d.namespace, dbUser, dbPass, dbName)
-		_ = applyManifest(ctx, mysqlManifest)
-		ui.Detail("Waiting for MySQL database to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/db", "-n", d.namespace, "--timeout=300s")
-		if err := waitCmd.Run(); err != nil {
-			return fmt.Errorf("MySQL failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
-		}
+%[9]s
+`, d.namespace, dbUser, dbPass, dbName, mysqlImage, commandInjection, sqlInitMount, sqlInitVolume, sqlConfigMap)
+		_ = d.writeManifest("dependency-mysql", mysqlManifest)
 	}
 
 	if needsRedis {
@@ -759,12 +1194,50 @@ spec:
   - port: 6379
     targetPort: 6379
 `, d.namespace)
-		_ = applyManifest(ctx, redisManifest)
-		ui.Detail("Waiting for Redis service to be ready...")
-		waitCmd := exec.CommandContext(ctx, "kubectl", "wait", "--for=condition=available", "deployment/redis", "-n", d.namespace, "--timeout=300s")
-		if err := waitCmd.Run(); err != nil {
-			return fmt.Errorf("Redis failed to become available (timed out after 300s). Check pod logs for ImagePullBackOff or config errors: %w", err)
-		}
+		_ = d.writeManifest("dependency-redis", redisManifest)
 	}
 	return nil
+}
+
+func (d *Deployer) syncLocalDockerData(ctx context.Context) {
+	// Check if old container exists
+	cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "-f", "name=whatomate_postgres")
+	out, err := cmd.Output()
+	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+		return // No local container to sync from
+	}
+	
+	// Create a marker so we only do this once
+	markerFile := filepath.Join(d.projectDir, ".idlistack", "data_synced.lock")
+	if _, err := os.Stat(markerFile); err == nil {
+		return // Already synced
+	}
+
+	ui.Detail("Detected existing local database. Dynamically migrating current data to Kubernetes...")
+	
+	// Scale down the app to release database connections before we drop the database
+	exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=0", "-n", d.namespace).Run()
+	time.Sleep(3 * time.Second)
+	
+	// Dump
+	dumpCmd := exec.CommandContext(ctx, "bash", "-c", "docker exec whatomate_postgres pg_dumpall -c -U whatomate > /tmp/whatomate_dump_auto.sql")
+	if err := dumpCmd.Run(); err != nil {
+		ui.Warn("Failed to dump local data: " + err.Error())
+		exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
+		return
+	}
+	
+	// Restore
+	restoreCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("kubectl exec -i -n %s deployment/db -- psql -U whatomate -d postgres < /tmp/whatomate_dump_auto.sql", d.namespace))
+	if err := restoreCmd.Run(); err != nil {
+		ui.Warn("Failed to restore data to Kubernetes: " + err.Error())
+		exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
+		return
+	}
+	
+	// Scale up the app again
+	exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
+	
+	os.WriteFile(markerFile, []byte("done"), 0644)
+	ui.Detail("Current data successfully migrated to dynamic environment!")
 }

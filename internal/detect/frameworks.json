@@ -8,22 +8,35 @@
       },
       "port": 2368,
       "env": {
-        "database__client": "mysql",
-        "database__connection__host": "db",
-        "database__connection__user": "ghost",
-        "database__connection__password": "ghost",
-        "database__connection__database": "ghost"
+        "url": "{{APP_URL}}",
+        "NODE_ENV": "production",
+        "server__host": "0.0.0.0",
+        "server__port": "2368",
+        "database__client": "sqlite3",
+        "database__connection__filename": "content/data/ghost-local.db",
+        "database__useNullAsDefault": "true"
       },
-      "dependencies": ["mysql"],
       "start_cmd": "(defined in ghost image)",
-      "dockerfile_template": "FROM ghost:{{version}}-alpine\nCOPY content /var/lib/ghost/content\nRUN rm -f /var/lib/ghost/content/themes/casper && rm -f /var/lib/ghost/content/themes/source"
+      "volumes": ["/var/lib/ghost/content/data"],
+      "dockerfile_template": "FROM ghost:{{version}}-alpine\nCOPY content /var/lib/ghost/content\nRUN rm -f /var/lib/ghost/content/themes/casper && rm -f /var/lib/ghost/content/themes/source\nENV NODE_ENV=production\nENV server__host=0.0.0.0\nENV server__port=2368\nENV database__client=sqlite3\nENV database__connection__filename=/var/lib/ghost/content/data/ghost-local.db\nENV database__useNullAsDefault=true\nVOLUME /var/lib/ghost/content/data\nEXPOSE 2368"
+    },
+    {
+      "id": "frappe",
+      "provider": "python",
+      "detect": {
+        "files": ["sites/apps.txt", "apps.txt"],
+        "dirs": ["apps/frappe", "sites", "frappe-bench"],
+        "dependencies": ["frappe"]
+      },
+      "port": 8000,
+      "dependencies": ["mariadb:10.6 --character-set-server=utf8mb4 --collation-server=utf8mb4_unicode_ci", "redis"],
+      "start_cmd": "(defined in frappe image)",
+      "dockerfile_template": "FROM frappe/frappe-worker:latest\nUSER root\n{{if .IsBench}}\nCOPY sites /home/frappe/frappe-bench/sites\n{{range .CustomApps}}\nCOPY apps/{{.}} /home/frappe/frappe-bench/apps/{{.}}\n{{end}}\n{{else}}\nRUN mkdir -p /home/frappe/frappe-bench/apps/{{index .CustomApps 0}}\nCOPY . /home/frappe/frappe-bench/apps/{{index .CustomApps 0}}\n{{end}}\nRUN cd /home/frappe/frappe-bench && \\\n{{range .CustomApps}}\n  ./env/bin/pip install -q -U -e apps/{{.}} && \\\n{{end}}\n  echo \"Custom apps installed\"\nRUN echo 'import os\\nfrom frappe.app import application as frappe_app\\n\\ndef application(environ, start_response):\\n    if \"HTTP_X_FRAPPE_SITE_NAME\" not in environ:\\n        try:\\n            with open(\"/home/frappe/frappe-bench/sites/currentsite.txt\", \"r\") as f:\\n                environ[\"HTTP_X_FRAPPE_SITE_NAME\"] = f.read().strip()\\n        except Exception:\\n            pass\\n    return frappe_app(environ, start_response)' > /home/frappe/frappe-bench/sites/serve.py\nRUN python3 -c \"import json, os; p='/home/frappe/frappe-bench/sites/common_site_config.json'; c=json.load(open(p)) if os.path.exists(p) else {}; c.update({'db_host': 'db', 'redis_cache': 'redis://redis:6379', 'redis_queue': 'redis://redis:6379', 'redis_socketio': 'redis://redis:6379'}); json.dump(c, open(p, 'w'))\"\nRUN echo 'import json, os, time\\nimport pymysql\\nimport pymysql.err\\nsite = open(\"/home/frappe/frappe-bench/sites/currentsite.txt\").read().strip()\\nsite_conf = json.load(open(f\"/home/frappe/frappe-bench/sites/{site}/site_config.json\"))\\ndb_user = site_conf.get(\"db_name\", site)\\ndb_pass = site_conf.get(\"db_password\", site)\\nconn = None\\nfor i in range(30):\\n    try:\\n        conn = pymysql.connect(host=\"db\", user=db_user, password=db_pass, database=db_user)\\n        break\\n    except Exception:\\n        time.sleep(1)\\ntry:\\n    if conn:\\n        conn.cursor().execute(\"SELECT 1 FROM tabDocType LIMIT 1\")\\nexcept pymysql.err.ProgrammingError:\\n    print(\"Database is empty. Initializing...\")\\n    os.system(f\"bench --site {site} reinstall --db-root-password \\\"{db_pass}\\\" --admin-password admin --yes\")\\nexcept Exception as e:\\n    pass\\nos.execv(\"/home/frappe/frappe-bench/env/bin/gunicorn\", [\"gunicorn\", \"--bind=0.0.0.0:8000\", \"--threads=4\", \"--workers=2\", \"--worker-class=gthread\", \"--timeout=120\", \"serve:application\"])\\n' > /home/frappe/frappe-bench/sites/start.py\nRUN chown -R frappe:frappe /home/frappe/frappe-bench/apps /home/frappe/frappe-bench/sites\nUSER frappe\nCMD [\"/home/frappe/frappe-bench/env/bin/python\", \"/home/frappe/frappe-bench/sites/start.py\"]"
     },
     {
       "id": "nextjs",
       "provider": "node",
-      "detect": {
-        "dependencies": ["next"]
-      },
+      "detect": { "dependencies": ["next"] },
       "port": 3000,
       "build_cmd": "npm run build",
       "start_cmd": "npm start"
@@ -31,21 +44,77 @@
     {
       "id": "nuxt",
       "provider": "node",
-      "detect": {
-        "dependencies": ["nuxt", "nuxt-edge"]
-      },
+      "detect": { "dependencies": ["nuxt", "nuxt3"] },
       "port": 3000,
       "build_cmd": "npm run build",
-      "start_cmd": "npm run start"
+      "start_cmd": "npm start"
+    },
+    {
+      "id": "nestjs",
+      "provider": "node",
+      "detect": { "dependencies": ["@nestjs/core"] },
+      "port": 3000,
+      "build_cmd": "npm run build",
+      "start_cmd": "npm run start:prod"
+    },
+    {
+      "id": "sveltekit",
+      "provider": "node",
+      "detect": { "dependencies": ["@sveltejs/kit"] },
+      "port": 3000,
+      "build_cmd": "npm run build",
+      "start_cmd": "node build/index.js"
     },
     {
       "id": "django",
       "provider": "python",
-      "detect": {
-        "dependencies": ["Django", "django"]
-      },
+      "detect": { "dependencies": ["Django", "django"] },
       "port": 8000,
       "start_cmd": "python manage.py runserver 0.0.0.0:8000"
+    },
+    {
+      "id": "fastapi",
+      "provider": "python",
+      "detect": { "dependencies": ["fastapi", "FastAPI"] },
+      "port": 8000,
+      "start_cmd": "uvicorn main:app --host 0.0.0.0 --port 8000"
+    },
+    {
+      "id": "flask",
+      "provider": "python",
+      "detect": { "dependencies": ["flask", "Flask"] },
+      "port": 5000,
+      "start_cmd": "flask run --host=0.0.0.0"
+    },
+    {
+      "id": "gin",
+      "provider": "go",
+      "detect": { "dependencies": ["github.com/gin-gonic/gin"] },
+      "port": 8080,
+      "build_cmd": "go build -o app .",
+      "start_cmd": "./app"
+    },
+    {
+      "id": "laravel",
+      "provider": "php",
+      "detect": { "dependencies": ["laravel/framework"] },
+      "port": 8000,
+      "start_cmd": "php artisan serve --host=0.0.0.0 --port=8000"
+    },
+    {
+      "id": "rails",
+      "provider": "ruby",
+      "detect": { "dependencies": ["rails"] },
+      "port": 3000,
+      "start_cmd": "bundle exec rails server -b 0.0.0.0"
+    },
+    {
+      "id": "actix",
+      "provider": "rust",
+      "detect": { "dependencies": ["actix-web"] },
+      "port": 8080,
+      "build_cmd": "cargo build --release",
+      "start_cmd": "cargo run --release"
     }
   ]
 }

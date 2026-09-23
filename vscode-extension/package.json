@@ -1,0 +1,80 @@
+{
+  "name": "idlistack-vscode",
+  "displayName": "IdliStack",
+  "description": "Zero-config deployment CLI extension directly in VS Code (Railway-like detection, OCI build & K3s deployment)",
+  "version": "1.4.0",
+  "publisher": "idlistack",
+  "engines": {
+    "vscode": "^1.80.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/saintlionelpraveen/Idlistack-CLI"
+  },
+  "activationEvents": [],
+  "main": "./extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "idlistack.init",
+        "title": "IdliStack: Initialize Project",
+        "icon": "$(file-code)"
+      },
+      {
+        "command": "idlistack.inspect",
+        "title": "IdliStack: Inspect Stack & Plan",
+        "icon": "$(search)"
+      },
+      {
+        "command": "idlistack.up",
+        "title": "IdliStack: Deploy to K3s (Up)",
+        "icon": "$(cloud-upload)"
+      },
+      {
+        "command": "idlistack.status",
+        "title": "IdliStack: Check Cluster Status",
+        "icon": "$(server-environment)"
+      },
+      {
+        "command": "idlistack.logs",
+        "title": "IdliStack: View Logs",
+        "icon": "$(terminal)"
+      },
+      {
+        "command": "idlistack.down",
+        "title": "IdliStack: Destroy (Down)",
+        "icon": "$(trash)"
+      }
+    ],
+    "menus": {
+      "editor/context": [
+        {
+          "command": "idlistack.inspect",
+          "group": "idlistack@1"
+        },
+        {
+          "command": "idlistack.up",
+          "group": "idlistack@2"
+        }
+      ],
+      "explorer/context": [
+        {
+          "command": "idlistack.inspect",
+          "group": "idlistack@1"
+        },
+        {
+          "command": "idlistack.up",
+          "group": "idlistack@2"
+        }
+      ]
+    }
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "@types/vscode": "^1.80.0"
+  },
+  "icon": "icon.png"
+}

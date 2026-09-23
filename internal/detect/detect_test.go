@@ -14,7 +14,7 @@ import (
 func TestProviderDetectionOrder(t *testing.T) {
 	providers := registry.GetProviders()
 	expectedOrder := []string{
-		"php", "go", "java", "rust", "ruby", "elixir",
+		"whatomate", "php", "go", "java", "rust", "ruby", "elixir",
 		"python", "deno", "dotnet", "node", "static", "shell",
 	}
 
@@ -31,7 +31,7 @@ func TestProviderDetectionOrder(t *testing.T) {
 
 // TestGetProviderByName ensures we can look up providers by name.
 func TestGetProviderByName(t *testing.T) {
-	names := []string{"node", "python", "go", "php", "ruby", "rust", "java", "elixir", "deno", "dotnet", "static", "shell"}
+	names := []string{"whatomate", "node", "python", "go", "php", "ruby", "rust", "java", "elixir", "deno", "dotnet", "static", "shell"}
 	for _, name := range names {
 		p := registry.GetProvider(name)
 		if p == nil {

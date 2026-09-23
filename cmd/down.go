@@ -64,10 +64,15 @@ func runDown(cmd *cobra.Command, args []string) error {
 		}
 	}
 
-	ui.Step(1, 2, "Deleting namespace")
+	ui.Step(1, 2, "Uninstalling Helm release")
 
+	if err := uninstallHelmRelease(ctx, appName, namespace); err != nil {
+		ui.Warn(fmt.Sprintf("Helm uninstall failed (might not exist): %v", err))
+	}
+	
+	// Helm might not delete the namespace if it wasn't the sole creator, so let's delete it explicitly
 	if err := deleteNamespace(ctx, namespace); err != nil {
-		return fmt.Errorf("failed to delete namespace: %w", err)
+		ui.Warn(fmt.Sprintf("Failed to delete namespace: %v", err))
 	}
 
 	ui.Step(2, 2, "Cleaning up local state")
@@ -78,6 +83,13 @@ func runDown(cmd *cobra.Command, args []string) error {
 
 	ui.Success(fmt.Sprintf("Project %s torn down successfully", color.CyanString(cfg.Project.Name)))
 	return nil
+}
+
+func uninstallHelmRelease(ctx context.Context, appName, namespace string) error {
+	cmd := exec.CommandContext(ctx, "helm", "uninstall", appName, "-n", namespace, "--ignore-not-found")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
 }
 
 func deleteNamespace(ctx context.Context, namespace string) error {

@@ -40,6 +40,61 @@
             "NODE_ENV": "production"
           }
         }
+        },
+        {
+          "id": "nuxt",
+          "detect": { "dependencies": ["nuxt", "nuxt3"] },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm start",
+          "env": { "NODE_ENV": "production" }
+        },
+        {
+          "id": "nestjs",
+          "detect": { "dependencies": ["@nestjs/core"] },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm run start:prod",
+          "env": { "NODE_ENV": "production" }
+        },
+        {
+          "id": "sveltekit",
+          "detect": { "dependencies": ["@sveltejs/kit"] },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "node build/index.js",
+          "env": { "NODE_ENV": "production" }
+        },
+        {
+          "id": "astro",
+          "detect": { "dependencies": ["astro"] },
+          "port": 4321,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm run start",
+          "env": { "NODE_ENV": "production" }
+        },
+        {
+          "id": "remix",
+          "detect": { "dependencies": ["@remix-run/react"] },
+          "port": 3000,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm run start",
+          "env": { "NODE_ENV": "production" }
+        },
+        {
+          "id": "vite",
+          "detect": { "dependencies": ["vite"] },
+          "port": 5173,
+          "install_cmd": "npm install",
+          "build_cmd": "npm run build",
+          "start_cmd": "npm run preview",
+          "env": { "NODE_ENV": "production" }
+        }
       ],
       "default": {
         "id": "node",
@@ -54,26 +109,29 @@
     {
       "id": "python",
       "detect": {
-        "files": ["requirements.txt", "pyproject.toml", "setup.py"]
+        "files": ["requirements.txt", "pyproject.toml", "setup.py", "Pipfile"]
       },
       "frameworks": [
         {
           "id": "django",
-          "detect": {
-            "dependencies": ["Django", "django"]
-          },
+          "detect": { "dependencies": ["Django", "django"] },
           "port": 8000,
           "install_cmd": "pip install -r requirements.txt",
           "start_cmd": "python manage.py runserver 0.0.0.0:8000"
         },
         {
           "id": "fastapi",
-          "detect": {
-            "dependencies": ["fastapi", "FastAPI"]
-          },
+          "detect": { "dependencies": ["fastapi", "FastAPI"] },
           "port": 8000,
           "install_cmd": "pip install -r requirements.txt",
           "start_cmd": "uvicorn main:app --host 0.0.0.0 --port 8000"
+        },
+        {
+          "id": "flask",
+          "detect": { "dependencies": ["flask", "Flask"] },
+          "port": 5000,
+          "install_cmd": "pip install -r requirements.txt",
+          "start_cmd": "flask run --host=0.0.0.0"
         }
       ],
       "default": {
@@ -88,12 +146,190 @@
       "detect": {
         "files": ["go.mod"]
       },
-      "frameworks": [],
+      "frameworks": [
+        {
+          "id": "gin",
+          "detect": { "dependencies": ["github.com/gin-glex/gin", "gin-gonic/gin"] },
+          "port": 8080,
+          "build_cmd": "go build -o app .",
+          "start_cmd": "./app"
+        },
+        {
+          "id": "fiber",
+          "detect": { "dependencies": ["github.com/gofiber/fiber"] },
+          "port": 3000,
+          "build_cmd": "go build -o app .",
+          "start_cmd": "./app"
+        },
+        {
+          "id": "echo",
+          "detect": { "dependencies": ["github.com/labstack/echo"] },
+          "port": 1323,
+          "build_cmd": "go build -o app .",
+          "start_cmd": "./app"
+        }
+      ],
       "default": {
         "id": "go",
         "port": 8080,
         "build_cmd": "go build -o app .",
         "start_cmd": "./app"
+      }
+    },
+    {
+      "id": "rust",
+      "detect": {
+        "files": ["Cargo.toml"]
+      },
+      "frameworks": [
+        {
+          "id": "actix",
+          "detect": { "dependencies": ["actix-web"] },
+          "port": 8080,
+          "build_cmd": "cargo build --release",
+          "start_cmd": "cargo run --release"
+        },
+        {
+          "id": "axum",
+          "detect": { "dependencies": ["axum"] },
+          "port": 3000,
+          "build_cmd": "cargo build --release",
+          "start_cmd": "cargo run --release"
+        },
+        {
+          "id": "rocket",
+          "detect": { "dependencies": ["rocket"] },
+          "port": 8000,
+          "build_cmd": "cargo build --release",
+          "start_cmd": "cargo run --release"
+        }
+      ],
+      "default": {
+        "id": "rust",
+        "port": 8000,
+        "build_cmd": "cargo build --release",
+        "start_cmd": "cargo run --release"
+      }
+    },
+    {
+      "id": "php",
+      "detect": {
+        "files": ["composer.json", "index.php"]
+      },
+      "frameworks": [
+        {
+          "id": "laravel",
+          "detect": { "dependencies": ["laravel/framework"] },
+          "port": 8000,
+          "install_cmd": "composer install",
+          "start_cmd": "php artisan serve --host=0.0.0.0 --port=8000"
+        },
+        {
+          "id": "symfony",
+          "detect": { "dependencies": ["symfony/framework-bundle"] },
+          "port": 8000,
+          "install_cmd": "composer install",
+          "start_cmd": "symfony server:start --port=8000"
+        }
+      ],
+      "default": {
+        "id": "php",
+        "port": 80,
+        "install_cmd": "composer install",
+        "start_cmd": "php -S 0.0.0.0:80 -t public/"
+      }
+    },
+    {
+      "id": "ruby",
+      "detect": {
+        "files": ["Gemfile"]
+      },
+      "frameworks": [
+        {
+          "id": "rails",
+          "detect": { "dependencies": ["rails"] },
+          "port": 3000,
+          "install_cmd": "bundle install",
+          "start_cmd": "bundle exec rails server -b 0.0.0.0"
+        },
+        {
+          "id": "sinatra",
+          "detect": { "dependencies": ["sinatra"] },
+          "port": 4567,
+          "install_cmd": "bundle install",
+          "start_cmd": "bundle exec ruby app.rb -o 0.0.0.0"
+        }
+      ],
+      "default": {
+        "id": "ruby",
+        "port": 3000,
+        "install_cmd": "bundle install",
+        "start_cmd": "bundle exec rackup --host 0.0.0.0 -p 3000"
+      }
+    },
+    {
+      "id": "java",
+      "detect": {
+        "files": ["pom.xml", "build.gradle"]
+      },
+      "frameworks": [
+        {
+          "id": "spring-boot",
+          "detect": { "dependencies": ["spring-boot-starter-web"] },
+          "port": 8080,
+          "build_cmd": "./mvnw clean package",
+          "start_cmd": "java -jar target/*.jar"
+        }
+      ],
+      "default": {
+        "id": "java",
+        "port": 8080,
+        "build_cmd": "javac Main.java",
+        "start_cmd": "java Main"
+      }
+    },
+    {
+      "id": "elixir",
+      "detect": {
+        "files": ["mix.exs"]
+      },
+      "frameworks": [
+        {
+          "id": "phoenix",
+          "detect": { "dependencies": ["phoenix"] },
+          "port": 4000,
+          "install_cmd": "mix deps.get",
+          "build_cmd": "mix compile",
+          "start_cmd": "mix phx.server"
+        }
+      ],
+      "default": {
+        "id": "elixir",
+        "port": 4000,
+        "install_cmd": "mix deps.get",
+        "build_cmd": "mix compile",
+        "start_cmd": "mix run --no-halt"
+      }
+    },
+    {
+      "id": "dotnet",
+      "detect": {
+        "files": ["*.csproj", "*.fsproj"]
+      },
+      "frameworks": [
+        {
+          "id": "aspnet",
+          "detect": { "dependencies": ["Microsoft.AspNetCore.App"] },
+          "port": 5000,
+          "build_cmd": "dotnet build -c Release",
+          "start_cmd": "dotnet run -c Release --urls=http://0.0.0.0:5000"
+        }
+      ],
+      "default": {
+        "id": "dotnet",
+        "port": 5000,
+        "build_cmd": "dotnet build -c Release",
+        "start_cmd": "dotnet run -c Release"
       }
     }
   ]

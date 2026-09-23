@@ -114,10 +114,37 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 
 	// ─── Return the best available plan ─────────────────────────────
 
+	// Layer 0.5 with a custom Dockerfile template (e.g. Ghost, Frappe)
+	// takes absolute priority — these are specialized images that cannot
+	// be reproduced by generic provider plans.
+	if layer05Plan != nil && err05 == nil && layer05Plan.DockerfilePath != "" {
+		if verbose {
+			ui.Detail("Detected by dynamic rules with custom Dockerfile: %s", color.CyanString(layer05Plan.DetectedFramework))
+		}
+		applyConfigOverrides(layer05Plan, cfg)
+		layer05Plan.Normalize()
+		return layer05Plan, nil
+	}
+
 	// Layer 0: Dockerfile wins by default when present
 	if layer0Plan != nil && err0 == nil {
 		applyConfigOverrides(layer0Plan, cfg)
+		layer0Plan.Normalize()
 		return layer0Plan, nil
+	}
+
+	// Configured Provider wins over everything else
+	if cfg != nil && cfg.Build.Provider != "" {
+		if layer1Plan != nil && err1 == nil && layer1Plan.Provider == cfg.Build.Provider {
+			applyConfigOverrides(layer1Plan, cfg)
+			layer1Plan.Normalize()
+			return layer1Plan, nil
+		}
+		if layer05Plan != nil && err05 == nil && layer05Plan.Provider == cfg.Build.Provider {
+			applyConfigOverrides(layer05Plan, cfg)
+			layer05Plan.Normalize()
+			return layer05Plan, nil
+		}
 	}
 
 	// Layer 0.5: Dynamic Rules Detection
@@ -126,6 +153,7 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			ui.Detail("Detected by dynamic rules: %s", color.CyanString(layer05Plan.DetectedFramework))
 		}
 		applyConfigOverrides(layer05Plan, cfg)
+		layer05Plan.Normalize()
 		return layer05Plan, nil
 	}
 
@@ -135,16 +163,32 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			ui.Detail("Detected by provider: %s", color.CyanString(providerName))
 		}
 		applyConfigOverrides(layer1Plan, cfg)
+		layer1Plan.Normalize()
 		return layer1Plan, nil
 	}
 
-	// ─── Layer 2: Nixpacks fallback ─────────────────────────────────
+	// ─── Layer 2: Railpack detection (Railway primary builder) ────────
+	if verbose {
+		ui.Detail("Trying Railpack detection...")
+	}
+	layerRailpackPlan, errRp := detectWithRailpack(ctx, projectDir, cfg, verbose)
+	if layerRailpackPlan != nil && errRp == nil {
+		if verbose {
+			ui.Detail("Detected by Railpack: %s", color.CyanString(layerRailpackPlan.Stack))
+		}
+		applyConfigOverrides(layerRailpackPlan, cfg)
+		layerRailpackPlan.Normalize()
+		return layerRailpackPlan, nil
+	}
+
+	// ─── Layer 2.5: Nixpacks fallback ─────────────────────────────────
 	if verbose {
 		ui.Detail("No native provider matched, trying Nixpacks fallback...")
 	}
 	layer2Plan, err2 := detectWithNixpacks(ctx, projectDir, cfg, verbose)
 	if layer2Plan != nil && err2 == nil {
 		applyConfigOverrides(layer2Plan, cfg)
+		layer2Plan.Normalize()
 		return layer2Plan, nil
 	}
 
@@ -152,6 +196,7 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	layer3Plan, err3 := detectLLM(ctx, projectDir, cfg)
 	if layer3Plan != nil && err3 == nil {
 		applyConfigOverrides(layer3Plan, cfg)
+		layer3Plan.Normalize()
 		return layer3Plan, nil
 	}
 
@@ -443,6 +488,9 @@ func detectDockerAndCompose(projectDir string) (*buildplan.Plan, error) {
 		if len(detectedEnv) > 0 {
 			plan.Env = detectedEnv
 		}
+		if len(detectedVolumes) > 0 {
+			plan.ComposeVolumes = detectedVolumes
+		}
 		return plan, nil
 	}
 
@@ -598,5 +646,106 @@ func parseNixpacksPlan(data []byte, projectDir string, verbose bool) (*buildplan
 		return nil, fmt.Errorf("nixpacks returned empty plan")
 	}
 
+	plan.Normalize()
+	return plan, nil
+}
+
+// ─── Layer 2: Railpack Detection ────────────────────────────────────────
+
+func detectWithRailpack(ctx context.Context, projectDir string, cfg *config.Config, verbose bool) (*buildplan.Plan, error) {
+	bin, err := exec.LookPath("railpack")
+	if err != nil {
+		return nil, err
+	}
+
+	cmd := exec.CommandContext(ctx, bin, "plan", projectDir)
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("railpack plan failed: %w", err)
+	}
+
+	return parseRailpackPlan(output, projectDir, verbose)
+}
+
+func parseRailpackPlan(data []byte, projectDir string, verbose bool) (*buildplan.Plan, error) {
+	var rpPlan struct {
+		Deploy struct {
+			StartCommand string            `json:"startCommand"`
+			Variables    map[string]string `json:"variables"`
+		} `json:"deploy"`
+		Steps []struct {
+			Name     string            `json:"name"`
+			Assets   map[string]string `json:"assets"`
+			Commands []struct {
+				Cmd string `json:"cmd"`
+			} `json:"commands"`
+		} `json:"steps"`
+	}
+
+	if err := json.Unmarshal(data, &rpPlan); err != nil {
+		return nil, fmt.Errorf("failed to parse railpack plan: %w", err)
+	}
+
+	plan := buildplan.NewDefaultPlan()
+	plan.DetectionSource = "layer2-railpack"
+	plan.DetectionConfidence = "high"
+	plan.StartCmd = rpPlan.Deploy.StartCommand
+
+	for _, step := range rpPlan.Steps {
+		if step.Assets != nil {
+			if miseToml, ok := step.Assets["generated-mise-toml"]; ok {
+				for _, lang := range []string{"python", "node", "go", "rust", "ruby", "php", "java", "elixir", "deno", "bun", "dotnet"} {
+					re := regexp.MustCompile(fmt.Sprintf(`(?m)^\s*%s\s*=\s*"([^"]+)"`, regexp.QuoteMeta(lang)))
+					if m := re.FindStringSubmatch(miseToml); len(m) > 1 {
+						plan.Provider = lang
+						plan.Runtime = m[1]
+						plan.StackVersion = m[1]
+						plan.DetectedFramework = lang
+						break
+					}
+				}
+			}
+		}
+		if step.Name == "install" && len(step.Commands) > 0 {
+			for _, c := range step.Commands {
+				if c.Cmd != "" {
+					plan.InstallCmd = c.Cmd
+					break
+				}
+			}
+		}
+		if step.Name == "build" && len(step.Commands) > 0 {
+			for _, c := range step.Commands {
+				if c.Cmd != "" {
+					plan.BuildCmd = c.Cmd
+					break
+				}
+			}
+		}
+	}
+
+	if plan.Port == 0 {
+		plan.Port = detectConfigPort(projectDir)
+		if plan.Port == 0 {
+			switch plan.Provider {
+			case "node":
+				plan.Port = 3000
+			case "python":
+				plan.Port = 8000
+			case "go":
+				plan.Port = 8080
+			case "rust":
+				plan.Port = 8080
+			default:
+				plan.Port = 8080
+			}
+		}
+	}
+
+	if plan.Provider == "" && plan.StartCmd == "" {
+		return nil, fmt.Errorf("railpack returned empty plan")
+	}
+
+	plan.Normalize()
 	return plan, nil
 }

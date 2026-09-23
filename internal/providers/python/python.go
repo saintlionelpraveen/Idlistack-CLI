@@ -4,6 +4,7 @@ package python
 
 import (
 	"fmt"
+	"os/exec"
 	"regexp"
 	"strings"
 
@@ -12,10 +13,11 @@ import (
 )
 
 type PythonProvider struct {
-	framework  string
-	version    string
-	hasPipfile bool
-	hasPoetry  bool
+	framework        string
+	frameworkVersion string
+	version          string
+	hasPipfile       bool
+	hasPoetry        bool
 }
 
 func (p *PythonProvider) Name() string {
@@ -37,14 +39,19 @@ func (p *PythonProvider) Initialize(ctx *provider.DetectContext) error {
 	p.hasPoetry = ctx.App.HasFile("pyproject.toml") && ctx.App.HasFileWithContent("pyproject.toml", "[tool.poetry]")
 	p.framework = p.detectFramework(ctx)
 	p.version = p.detectVersion(ctx)
+	p.frameworkVersion = p.detectFrameworkVersion(ctx)
 	return nil
 }
 
 func (p *PythonProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error) {
 	plan := buildplan.NewDefaultPlan()
 	plan.Provider = "python"
-	plan.DetectedFramework = p.framework
+	plan.Stack = "Python"
+	plan.StackVersion = p.version
 	plan.Runtime = p.version
+	plan.DetectedFramework = p.framework
+	plan.Framework = p.framework
+	plan.FrameworkVersion = p.frameworkVersion
 
 	// Install command
 	if p.hasPoetry {
@@ -116,10 +123,16 @@ func (p *PythonProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, err
 		}
 	}
 
+	plan.Normalize()
 	return plan, nil
 }
 
 func (p *PythonProvider) detectFramework(ctx *provider.DetectContext) string {
+	// Frappe
+	if ctx.App.HasDir("apps/frappe") || ctx.App.HasFile("sites/apps.txt") || p.hasDependency(ctx, "frappe") {
+		return "frappe"
+	}
+
 	// Django — manage.py is the canonical indicator
 	if ctx.App.HasFile("manage.py") {
 		return "django"
@@ -144,10 +157,37 @@ func (p *PythonProvider) detectFramework(ctx *provider.DetectContext) string {
 }
 
 func (p *PythonProvider) detectVersion(ctx *provider.DetectContext) string {
+	// Check virtualenvs (env/pyvenv.cfg, .venv/pyvenv.cfg)
+	for _, venv := range []string{"env/pyvenv.cfg", ".venv/pyvenv.cfg", "venv/pyvenv.cfg"} {
+		if ctx.App.HasFile(venv) {
+			if content, err := ctx.App.ReadFileString(venv); err == nil {
+				for _, line := range strings.Split(content, "\n") {
+					line = strings.TrimSpace(line)
+					if strings.HasPrefix(line, "version_info =") || strings.HasPrefix(line, "version =") {
+						parts := strings.SplitN(line, "=", 2)
+						if len(parts) == 2 {
+							return strings.TrimSpace(parts[1])
+						}
+					}
+				}
+			}
+		}
+	}
+
+	// Check .python-version
+	if ctx.App.HasFile(".python-version") {
+		if content, err := ctx.App.ReadFileString(".python-version"); err == nil {
+			v := strings.TrimSpace(content)
+			if v != "" {
+				return v
+			}
+		}
+	}
+
 	// Check runtime.txt (Heroku convention)
 	if ctx.App.HasFile("runtime.txt") {
 		if content, err := ctx.App.ReadFileString("runtime.txt"); err == nil {
-			re := regexp.MustCompile(`python-(\d+\.\d+)`)
+			re := regexp.MustCompile(`python-(\d+\.\d+(\.\d+)?)`)
 			if matches := re.FindStringSubmatch(strings.TrimSpace(content)); len(matches) > 1 {
 				return matches[1]
 			}
@@ -157,14 +197,72 @@ func (p *PythonProvider) detectVersion(ctx *provider.DetectContext) string {
 	// Check pyproject.toml for requires-python
 	if ctx.App.HasFile("pyproject.toml") {
 		if content, err := ctx.App.ReadFileString("pyproject.toml"); err == nil {
-			re := regexp.MustCompile(`requires-python\s*=\s*["><=]*\s*(\d+\.\d+)`)
+			re := regexp.MustCompile(`requires-python\s*=\s*["><=~^\s]*(\d+\.\d+)`)
 			if matches := re.FindStringSubmatch(content); len(matches) > 1 {
 				return matches[1]
 			}
 		}
 	}
 
+	// Host python fallback
+	if out, err := exec.Command("python3", "-V").Output(); err == nil {
+		fields := strings.Fields(string(out))
+		if len(fields) >= 2 {
+			return fields[1]
+		}
+	}
+
 	return "3"
+}
+
+func (p *PythonProvider) detectFrameworkVersion(ctx *provider.DetectContext) string {
+	switch p.framework {
+	case "frappe":
+		for _, fpath := range []string{"apps/frappe/frappe/__init__.py", "frappe/__init__.py"} {
+			if ctx.App.HasFile(fpath) {
+				if c, err := ctx.App.ReadFileString(fpath); err == nil {
+					re := regexp.MustCompile(`__version__\s*=\s*["']([^"']+)["']`)
+					if m := re.FindStringSubmatch(c); len(m) > 1 {
+						return m[1]
+					}
+				}
+			}
+		}
+		if ctx.App.HasFile("apps/frappe/pyproject.toml") {
+			if c, err := ctx.App.ReadFileString("apps/frappe/pyproject.toml"); err == nil {
+				re := regexp.MustCompile(`version\s*=\s*["']([^"']+)["']`)
+				if m := re.FindStringSubmatch(c); len(m) > 1 {
+					return m[1]
+				}
+			}
+		}
+	case "django", "fastapi", "flask", "streamlit":
+		depNames := map[string][]string{
+			"django":    {"django", "Django"},
+			"fastapi":   {"fastapi", "FastAPI"},
+			"flask":     {"flask", "Flask"},
+			"streamlit": {"streamlit", "Streamlit"},
+		}
+		for _, name := range depNames[p.framework] {
+			if ctx.App.HasFile("requirements.txt") {
+				if c, err := ctx.App.ReadFileString("requirements.txt"); err == nil {
+					re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(name) + `[=~><^]*([\d\.]+)`)
+					if m := re.FindStringSubmatch(c); len(m) > 1 {
+						return m[1]
+					}
+				}
+			}
+			if ctx.App.HasFile("pyproject.toml") {
+				if c, err := ctx.App.ReadFileString("pyproject.toml"); err == nil {
+					re := regexp.MustCompile(`(?i)` + regexp.QuoteMeta(name) + `[=~><^"'\s]*([\d\.]+)`)
+					if m := re.FindStringSubmatch(c); len(m) > 1 {
+						return m[1]
+					}
+				}
+			}
+		}
+	}
+	return ""
 }
 
 func (p *PythonProvider) hasDependency(ctx *provider.DetectContext, name string) bool {
