@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/fatih/color"
 	"github.com/idlistack/cli/internal/config"
@@ -82,16 +83,18 @@ provider = "%s"`, plan.Provider)
 		if plan.Runtime != "" {
 			buildSection += fmt.Sprintf("\nruntime = \"%s\"", plan.Runtime)
 		}
-		if plan.PreInstallCmd != "" {
+		if plan.PreInstallCmd != "" && len(plan.PreInstallCmd) < 80 {
 			buildSection += fmt.Sprintf("\npre_install_cmd = %q", plan.PreInstallCmd)
+		} else if plan.PreInstallCmd != "" {
+			buildSection += "\n# pre_install_cmd = \"\" # override provider default if needed"
 		}
-		if plan.InstallCmd != "" {
+		if plan.InstallCmd != "" && len(plan.InstallCmd) < 80 {
 			buildSection += fmt.Sprintf("\ninstall_cmd = %q", plan.InstallCmd)
 		}
 		if plan.BuildCmd != "" {
 			buildSection += fmt.Sprintf("\nbuild_cmd = %q", plan.BuildCmd)
 		}
-		if plan.StartCmd != "" {
+		if plan.StartCmd != "" && !strings.HasPrefix(plan.StartCmd, "/") {
 			buildSection += fmt.Sprintf("\nstart_cmd = %q", plan.StartCmd)
 		}
 

@@ -85,11 +85,13 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	chartYaml := fmt.Sprintf("apiVersion: v2\nname: %s\ndescription: Idlistack App\nversion: 0.1.0\nappVersion: 1.0.0\n", d.appName)
 	os.WriteFile(filepath.Join(helmDir, "Chart.yaml"), []byte(chartYaml), 0644)
 
+	// ─── Namespace Manager ──────────────────────────────────────────
+	if err := d.ensureNamespace(ctx); err != nil {
+		return "", err
+	}
+
 	// ─── Clean up previous failed deployments ───────────────────────
 	d.cleanupOldDeployment(ctx)
-
-	// ─── Namespace Manager ──────────────────────────────────────────
-	// Helm manages namespace creation with --create-namespace
 
 	// ─── Ensure Dependency Services (Postgres, Redis, etc.) ─────────
 	if err := d.ensureDependencies(ctx); err != nil {
@@ -127,9 +129,7 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 	}
 
 	// ─── Auto-Migrate Local Data (if applicable) ────────────────────
-	if d.appName == "w1" || d.appName == "whatomate" || strings.Contains(d.projectDir, "whatomate") {
-		d.syncLocalDockerData(ctx)
-	}
+	d.syncLocalDockerData(ctx)
 
 	// ─── Get URL ────────────────────────────────────────────────────
 	url := d.getServiceURL(ctx)
@@ -140,7 +140,44 @@ func (d *Deployer) Deploy(ctx context.Context, verbose bool) (string, error) {
 // ─── Namespace ──────────────────────────────────────────────────────────
 
 func (d *Deployer) ensureNamespace(ctx context.Context) error {
-	// Let Helm handle namespace creation
+	// Check if namespace exists and if it is in Terminating state
+	checkCmd := exec.CommandContext(ctx, "kubectl", "get", "namespace", d.namespace, "-o", "jsonpath={.status.phase}")
+	phaseBytes, err := checkCmd.Output()
+	if err != nil {
+		// Namespace doesn't exist yet; Helm will create it with --create-namespace
+		return nil
+	}
+
+	phase := strings.TrimSpace(string(phaseBytes))
+	if phase == "Terminating" {
+		ui.Warn(fmt.Sprintf("Namespace %s is in Terminating state. Waiting for cleanup to complete...", d.namespace))
+
+		deadline := time.Now().Add(45 * time.Second)
+		forced := false
+		for time.Now().Before(deadline) {
+			time.Sleep(2 * time.Second)
+
+			// Check if namespace is deleted
+			chk := exec.CommandContext(ctx, "kubectl", "get", "namespace", d.namespace)
+			if err := chk.Run(); err != nil {
+				ui.Success(fmt.Sprintf("Namespace %s cleaned up successfully", d.namespace))
+				return nil
+			}
+
+			// If still terminating after 6 seconds, force-terminate stuck pods and PVCs
+			if !forced && time.Now().After(deadline.Add(-39*time.Second)) {
+				forced = true
+				ui.Detail("Forcing termination of stuck resources in namespace %s...", d.namespace)
+				exec.CommandContext(ctx, "kubectl", "delete", "pods", "--all", "-n", d.namespace, "--force", "--grace-period=0").Run()
+				exec.CommandContext(ctx, "kubectl", "delete", "pvc", "--all", "-n", d.namespace, "--force", "--grace-period=0").Run()
+				finalizeCmd := fmt.Sprintf("kubectl get ns %s -o json | jq '.spec.finalizers = []' | kubectl replace --raw /api/v1/namespaces/%s/finalize -f - 2>/dev/null || true", d.namespace, d.namespace)
+				exec.CommandContext(ctx, "bash", "-c", finalizeCmd).Run()
+			}
+		}
+
+		return fmt.Errorf("namespace %s is stuck in Terminating state; please check with 'kubectl get ns %s -o yaml'", d.namespace, d.namespace)
+	}
+
 	return nil
 }
 
@@ -203,20 +240,45 @@ spec:
 	// Generate inline env vars from plan and provisioned dependencies
 	envSection := ""
 	dbUser, dbPass, dbName := d.extractDbCredentials()
+	needsPostgres, needsMysql, needsRedis, _, _ := d.detectDependencies()
 
 	containerEnv := make(map[string]string)
 	containerEnv["APP_URL"] = appUrl
-	containerEnv["DB_HOST"] = "db"
-	containerEnv["DB_PORT"] = "3306"
-	containerEnv["DB_USER"] = dbUser
-	containerEnv["DB_PASS"] = dbPass
-	containerEnv["DB_PASSWORD"] = dbPass
-	containerEnv["DB_NAME"] = dbName
-	containerEnv["MYSQL_HOST"] = "db"
-	containerEnv["MYSQL_PORT"] = "3306"
-	containerEnv["MYSQL_USER"] = dbUser
-	containerEnv["MYSQL_PASSWORD"] = dbPass
-	containerEnv["MYSQL_DATABASE"] = dbName
+
+	if needsMysql {
+		containerEnv["DB_HOST"] = "db"
+		containerEnv["DB_PORT"] = "3306"
+		containerEnv["DB_USER"] = dbUser
+		containerEnv["DB_PASS"] = dbPass
+		containerEnv["DB_PASSWORD"] = dbPass
+		containerEnv["DB_NAME"] = dbName
+		containerEnv["MYSQL_HOST"] = "db"
+		containerEnv["MYSQL_PORT"] = "3306"
+		containerEnv["MYSQL_USER"] = dbUser
+		containerEnv["MYSQL_PASSWORD"] = dbPass
+		containerEnv["MYSQL_DATABASE"] = dbName
+	} else if needsPostgres {
+		containerEnv["DB_HOST"] = "db"
+		containerEnv["DB_PORT"] = "5432"
+		containerEnv["DB_USER"] = dbUser
+		containerEnv["DB_PASS"] = dbPass
+		containerEnv["DB_PASSWORD"] = dbPass
+		containerEnv["DB_NAME"] = dbName
+		containerEnv["POSTGRES_HOST"] = "db"
+		containerEnv["POSTGRES_PORT"] = "5432"
+		containerEnv["POSTGRES_USER"] = dbUser
+		containerEnv["POSTGRES_PASSWORD"] = dbPass
+		containerEnv["POSTGRES_DB"] = dbName
+		containerEnv["PGHOST"] = "db"
+		containerEnv["PGPORT"] = "5432"
+		containerEnv["PGUSER"] = dbUser
+		containerEnv["PGPASSWORD"] = dbPass
+		containerEnv["PGDATABASE"] = dbName
+	}
+	if needsRedis {
+		containerEnv["REDIS_HOST"] = "redis"
+		containerEnv["REDIS_PORT"] = "6379"
+	}
 
 	cleanAppUrl := strings.TrimSuffix(appUrl, "/")
 	localhostRegex := regexp.MustCompile(`https?://(?:localhost|127\.0\.0\.1)(?::\d+)?(/?)`)
@@ -226,7 +288,11 @@ spec:
 		v = strings.ReplaceAll(v, "{{DB_PASS}}", dbPass)
 		v = strings.ReplaceAll(v, "{{DB_NAME}}", dbName)
 		v = strings.ReplaceAll(v, "{{DB_HOST}}", "db")
-		v = strings.ReplaceAll(v, "{{DB_PORT}}", "3306")
+		if needsPostgres {
+			v = strings.ReplaceAll(v, "{{DB_PORT}}", "5432")
+		} else {
+			v = strings.ReplaceAll(v, "{{DB_PORT}}", "3306")
+		}
 		v = strings.ReplaceAll(v, "{{APP_URL}}", appUrl)
 
 		// Dynamically replace hardcoded localhost / 127.0.0.1 URLs with real NodePort appUrl
@@ -606,16 +672,40 @@ func (d *Deployer) cleanupOldDeployment(ctx context.Context) {
 	}
 }
 
-// showPodLogs fetches and prints the last 30 lines of logs from the crashing pod
+// showPodLogs fetches diagnostic logs, events, and pod statuses on deployment failure
 func (d *Deployer) showPodLogs(ctx context.Context) {
-	cmd := exec.CommandContext(ctx, "kubectl", "logs",
-		"-n", d.namespace, "-l", fmt.Sprintf("app=%s", d.appName),
-		"--tail=30", "--all-containers=true")
-	output, err := cmd.Output()
-	if err == nil && len(output) > 0 {
+	fmt.Println()
+	ui.Info("─── Pod Statuses in Namespace ───")
+	getPodsCmd := exec.CommandContext(ctx, "kubectl", "get", "pods", "-n", d.namespace, "-o", "wide")
+	getPodsCmd.Stdout = os.Stdout
+	getPodsCmd.Stderr = os.Stderr
+	_ = getPodsCmd.Run()
+
+	// Show any warning events in the namespace (ImagePullBackOff, CrashLoopBackOff, etc.)
+	eventsCmd := exec.CommandContext(ctx, "kubectl", "get", "events", "-n", d.namespace,
+		"--field-selector", "type=Warning", "--sort-by=.metadata.creationTimestamp")
+	if eventsOut, err := eventsCmd.Output(); err == nil && len(strings.TrimSpace(string(eventsOut))) > 0 {
 		fmt.Println()
-		ui.Info("─── Pod Logs (last 30 lines) ───")
+		ui.Warn("─── Kubernetes Warning Events ───")
+		fmt.Println(string(eventsOut))
+	}
+
+	// Fetch logs for all pods in the namespace
+	fmt.Println()
+	ui.Info("─── Pod Logs (last 30 lines) ───")
+	cmd := exec.CommandContext(ctx, "kubectl", "logs",
+		"-n", d.namespace, "--selector", "managed-by=idlistack",
+		"--tail=30", "--all-containers=true", "--prefix=true")
+	output, err := cmd.Output()
+	if err == nil && len(strings.TrimSpace(string(output))) > 0 {
 		fmt.Println(string(output))
+	} else {
+		fallbackCmd := exec.CommandContext(ctx, "kubectl", "logs",
+			"-n", d.namespace, "-l", fmt.Sprintf("app=%s", d.appName),
+			"--tail=30", "--all-containers=true")
+		if fbOut, fbErr := fallbackCmd.Output(); fbErr == nil && len(fbOut) > 0 {
+			fmt.Println(string(fbOut))
+		}
 	}
 }
 
@@ -828,27 +918,19 @@ func (d *Deployer) extractDbCredentials() (user, pass, dbname string) {
 	return user, pass, dbname
 }
 
-func (d *Deployer) ensureDependencies(ctx context.Context) error {
+// detectDependencies identifies backing services (PostgreSQL, MySQL/MariaDB, Redis)
+func (d *Deployer) detectDependencies() (needsPostgres, needsMysql, needsRedis bool, mysqlImage, mysqlCommand string) {
 	if d.projectDir == "" {
-		return nil
+		return
 	}
-
-	dbUser, dbPass, dbName := d.extractDbCredentials()
-
-	needsPostgres := false
-	needsRedis := false
-	needsMysql := false
 
 	allDeps := make([]string, 0)
 	if len(d.config.Deploy.Dependencies) > 0 {
 		allDeps = append(allDeps, d.config.Deploy.Dependencies...)
 	}
-	if len(d.plan.Dependencies) > 0 {
+	if d.plan != nil && len(d.plan.Dependencies) > 0 {
 		allDeps = append(allDeps, d.plan.Dependencies...)
 	}
-
-	var mysqlImage string
-	var mysqlCommand string
 
 	if len(allDeps) > 0 {
 		for _, dep := range allDeps {
@@ -896,6 +978,55 @@ func (d *Deployer) ensureDependencies(ctx context.Context) error {
 			}
 		}
 	}
+
+	if needsMysql {
+		if mysqlImage == "" || mysqlImage == "mysql" {
+			mysqlImage = "mariadb:10.6"
+		} else if mysqlImage == "mariadb" {
+			mysqlImage = "mariadb:10.6"
+		}
+	}
+	return
+}
+
+// GetRequiredImages returns all container images required by this application and its dependencies
+func (d *Deployer) GetRequiredImages() []string {
+	images := []string{d.imageTag}
+
+	needsPostgres, needsMysql, needsRedis, mysqlImage, _ := d.detectDependencies()
+	if needsPostgres {
+		images = append(images, "postgres:15-alpine")
+	}
+	if needsMysql && mysqlImage != "" {
+		images = append(images, mysqlImage)
+	}
+	if needsRedis {
+		images = append(images, "redis:alpine")
+	}
+
+	// Check if busybox init container is needed for volume permissions
+	if d.plan != nil && (len(d.plan.ComposeVolumes) > 0 || len(d.plan.Volumes) > 0) {
+		images = append(images, "busybox:1.36")
+	}
+
+	seen := make(map[string]bool)
+	var unique []string
+	for _, img := range images {
+		if img != "" && !seen[img] {
+			seen[img] = true
+			unique = append(unique, img)
+		}
+	}
+	return unique
+}
+
+func (d *Deployer) ensureDependencies(ctx context.Context) error {
+	if d.projectDir == "" {
+		return nil
+	}
+
+	dbUser, dbPass, dbName := d.extractDbCredentials()
+	needsPostgres, needsMysql, needsRedis, mysqlImage, mysqlCommand := d.detectDependencies()
 
 	if needsPostgres {
 		ui.Detail("Provisioning dependency: %s (db: %s, user: %s)", color.CyanString("Postgres (db)"), dbName, dbUser)
@@ -1200,10 +1331,22 @@ spec:
 }
 
 func (d *Deployer) syncLocalDockerData(ctx context.Context) {
-	// Check if old container exists
-	cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "-f", "name=whatomate_postgres")
-	out, err := cmd.Output()
-	if err != nil || len(strings.TrimSpace(string(out))) == 0 {
+	// Dynamically check if a local container exists matching this app's database
+	filterNames := []string{
+		fmt.Sprintf("name=%s_postgres", d.appName),
+		fmt.Sprintf("name=%s-postgres", d.appName),
+		fmt.Sprintf("name=%s_db", d.appName),
+		fmt.Sprintf("name=%s-db", d.appName),
+	}
+	var localContainer string
+	for _, f := range filterNames {
+		cmd := exec.CommandContext(ctx, "docker", "ps", "-q", "-f", f)
+		if out, err := cmd.Output(); err == nil && len(strings.TrimSpace(string(out))) > 0 {
+			localContainer = strings.TrimSpace(string(out))
+			break
+		}
+	}
+	if localContainer == "" {
 		return // No local container to sync from
 	}
 	
@@ -1213,14 +1356,23 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 		return // Already synced
 	}
 
-	ui.Detail("Detected existing local database. Dynamically migrating current data to Kubernetes...")
+	ui.Detail("Detected existing local database container. Dynamically migrating current data to Kubernetes...")
 	
+	dbUser, _, dbName := d.extractDbCredentials()
+	if dbUser == "" {
+		dbUser = "postgres"
+	}
+	if dbName == "" {
+		dbName = "postgres"
+	}
+
 	// Scale down the app to release database connections before we drop the database
 	exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=0", "-n", d.namespace).Run()
 	time.Sleep(3 * time.Second)
 	
+	dumpFile := fmt.Sprintf("/tmp/%s_dump_auto.sql", d.appName)
 	// Dump
-	dumpCmd := exec.CommandContext(ctx, "bash", "-c", "docker exec whatomate_postgres pg_dumpall -c -U whatomate > /tmp/whatomate_dump_auto.sql")
+	dumpCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("docker exec %s pg_dumpall -c -U %s > %s", localContainer, dbUser, dumpFile))
 	if err := dumpCmd.Run(); err != nil {
 		ui.Warn("Failed to dump local data: " + err.Error())
 		exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()
@@ -1228,7 +1380,7 @@ func (d *Deployer) syncLocalDockerData(ctx context.Context) {
 	}
 	
 	// Restore
-	restoreCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("kubectl exec -i -n %s deployment/db -- psql -U whatomate -d postgres < /tmp/whatomate_dump_auto.sql", d.namespace))
+	restoreCmd := exec.CommandContext(ctx, "bash", "-c", fmt.Sprintf("kubectl exec -i -n %s deployment/db -- psql -U %s -d %s < %s", d.namespace, dbUser, dbName, dumpFile))
 	if err := restoreCmd.Run(); err != nil {
 		ui.Warn("Failed to restore data to Kubernetes: " + err.Error())
 		exec.CommandContext(ctx, "kubectl", "scale", "deployment", d.appName, "--replicas=1", "-n", d.namespace).Run()

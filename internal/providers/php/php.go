@@ -49,8 +49,11 @@ func (p *PhpProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error)
 	plan.Runtime = p.phpVersion
 	plan.Stack = "PHP"
 	plan.StackVersion = p.phpVersion
-	plan.StaticDir = p.documentRoot
-	plan.Port = 8080
+	targetPort := 8080
+	if ctx.Config != nil && ctx.Config.Deploy.Port != 0 {
+		targetPort = ctx.Config.Deploy.Port
+	}
+	plan.Port = targetPort
 
 	// Dynamically detect required PHP extensions and apt packages
 	extensions, aptDeps := p.detectExtensions(ctx)
@@ -90,9 +93,9 @@ func (p *PhpProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error)
 		preInstallSteps = append(preInstallSteps, fmt.Sprintf("docker-php-ext-install -j$(nproc) %s", strings.Join(extensions, " ")))
 	}
 
-	// Configure Apache: Port 8080, mod_rewrite, mod_headers, mod_setenvif, AllowOverride All, and DocumentRoot
+	// Configure Apache: dynamic port, mod_rewrite, mod_headers, mod_setenvif, AllowOverride All, and DocumentRoot
 	apacheConfigSteps := []string{
-		"sed -i 's/80/8080/g' /etc/apache2/ports.conf /etc/apache2/sites-available/*.conf",
+		fmt.Sprintf("sed -i -E 's/Listen [0-9]+/Listen %d/g' /etc/apache2/ports.conf && sed -i -E 's/<VirtualHost \\*:[0-9]+>/<VirtualHost *:%d>/g' /etc/apache2/sites-available/*.conf /etc/apache2/sites-enabled/*.conf", targetPort, targetPort),
 		"a2enmod rewrite headers setenvif",
 		"sed -i 's/AllowOverride None/AllowOverride All/g' /etc/apache2/apache2.conf",
 		"echo 'SetEnvIf Request_URI \".*\" HTTPS=on' > /etc/apache2/conf-available/idlistack-ssl.conf && a2enconf idlistack-ssl",
@@ -102,8 +105,8 @@ func (p *PhpProvider) Plan(ctx *provider.DetectContext) (*buildplan.Plan, error)
 	}
 	preInstallSteps = append(preInstallSteps, strings.Join(apacheConfigSteps, " && "))
 
-	// Create production php.ini settings and entrypoint script with automatic .htaccess HTTPS redirect sanitizer
-	iniAndEntrypoint := `echo "mysqli.default_host = db\nmysqli.default_port = 3306\npdo_mysql.default_socket = /var/run/mysqld/mysqld.sock\nupload_max_filesize = 64M\npost_max_size = 64M\nmemory_limit = 256M\nmax_execution_time = 300" > /usr/local/etc/php/conf.d/idlistack.ini && echo '#!/bin/sh\nmkdir -p /var/run/mysqld && chmod 777 /var/run/mysqld\nDB_TARGET="${DB_HOST:-db}"\nsocat TCP-LISTEN:3306,fork,bind=127.0.0.1,reuseaddr TCP:$DB_TARGET:3306 2>/dev/null &\nsocat UNIX-LISTEN:/var/run/mysqld/mysqld.sock,fork,mode=777 TCP:$DB_TARGET:3306 2>/dev/null &\nfind /var/www/html -maxdepth 2 -name ".htaccess" -exec sed -i -E "s/^[[:space:]]*(RewriteCond[[:space:]]+%{HTTPS}[[:space:]]+off)/# \1/gI" {} + 2>/dev/null || true\nfind /var/www/html -maxdepth 2 -name ".htaccess" -exec sed -i -E "s/^[[:space:]]*(RewriteRule[[:space:]]+.*https:\/\/)/# \1/gI" {} + 2>/dev/null || true\nexec apache2-foreground "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh`
+	// Create production php.ini settings and entrypoint script with automatic .htaccess HTTPS redirect sanitizer & upload permissions
+	iniAndEntrypoint := `echo "mysqli.default_host = db\nmysqli.default_port = 3306\npdo_mysql.default_socket = /var/run/mysqld/mysqld.sock\nupload_max_filesize = 64M\npost_max_size = 64M\nmemory_limit = 256M\nmax_execution_time = 300" > /usr/local/etc/php/conf.d/idlistack.ini && echo '#!/bin/sh\nmkdir -p /var/run/mysqld && chmod 777 /var/run/mysqld\nmkdir -p /var/www/html/uploads\nchown -R www-data:www-data /var/www/html/uploads /var/www/html/storage /var/www/html/cache 2>/dev/null || true\nchmod -R 777 /var/www/html/uploads /var/www/html/storage /var/www/html/cache 2>/dev/null || true\nDB_TARGET="${DB_HOST:-db}"\nsocat TCP-LISTEN:3306,fork,bind=127.0.0.1,reuseaddr TCP:$DB_TARGET:3306 2>/dev/null &\nsocat UNIX-LISTEN:/var/run/mysqld/mysqld.sock,fork,mode=777 TCP:$DB_TARGET:3306 2>/dev/null &\nfind /var/www/html -maxdepth 2 -name ".htaccess" -exec sed -i -E "s/^[[:space:]]*(RewriteCond[[:space:]]+%{HTTPS}[[:space:]]+off)/# \1/gI" {} + 2>/dev/null || true\nfind /var/www/html -maxdepth 2 -name ".htaccess" -exec sed -i -E "s/^[[:space:]]*(RewriteRule[[:space:]]+.*https:\/\/)/# \1/gI" {} + 2>/dev/null || true\nexec apache2-foreground "$@"' > /entrypoint.sh && chmod +x /entrypoint.sh`
 	preInstallSteps = append(preInstallSteps, iniAndEntrypoint)
 
 	if len(preInstallSteps) > 0 {

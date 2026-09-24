@@ -219,10 +219,21 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// ─── Step 5: Load image into cluster ─────────────────────────────────
 	ui.Step(5, 6, "Loading image into cluster")
 
-	clusterRuntime, err := loadImageIntoCluster(ctx, imageTag)
-	if err != nil {
-		return fmt.Errorf("image load failed: %w", err)
+	deployer := k8s.NewDeployer(cfg, plan, imageTag, cwd)
+	requiredImages := deployer.GetRequiredImages()
+
+	var clusterRuntime ClusterRuntime
+	for _, img := range requiredImages {
+		if !strings.HasPrefix(img, "idlistack/") {
+			ensureHostDockerImage(ctx, img)
+		}
+		rt, err := loadImageIntoCluster(ctx, img)
+		if err != nil {
+			return fmt.Errorf("image load failed for %s: %w", img, err)
+		}
+		clusterRuntime = rt
 	}
+
 	runtimeName := "cluster"
 	switch clusterRuntime {
 	case RuntimeMinikube:
@@ -234,12 +245,11 @@ func runUp(cmd *cobra.Command, args []string) error {
 	case RuntimeDockerDesktop:
 		runtimeName = "Docker Desktop"
 	}
-	ui.Detail("Image loaded into %s", runtimeName)
+	ui.Detail("All images loaded into %s", runtimeName)
 
 	// ─── Step 6: Deploy to Kubernetes via Helm ───────────────────────────────
 	ui.Step(6, 6, "Deploying to Kubernetes via Helm")
 
-	deployer := k8s.NewDeployer(cfg, plan, imageTag, cwd)
 	url, err := deployer.Deploy(ctx, Verbose)
 	if err != nil {
 		return fmt.Errorf("deployment failed: %w", err)
@@ -460,6 +470,10 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 
 	// Copy from builder
 	df.WriteString(fmt.Sprintf("COPY --from=builder %s %s\n", workdir, workdir))
+
+	if plan.Provider == "php" {
+		df.WriteString("RUN mkdir -p /var/www/html/uploads /var/www/html/storage /var/www/html/cache && chown -R www-data:www-data /var/www/html && chmod -R 775 /var/www/html && chmod -R 777 /var/www/html/uploads /var/www/html/storage /var/www/html/cache 2>/dev/null || true\n")
+	}
 
 	// Add Environment Variables
 	if plan.Env != nil {
@@ -710,9 +724,35 @@ func loadIntoK3s(ctx context.Context, imageTag string) error {
 	return importCmd.Run()
 }
 
+func ensureHostDockerImage(ctx context.Context, img string) {
+	inspectCmd := exec.CommandContext(ctx, "docker", "image", "inspect", img)
+	if inspectCmd.Run() == nil {
+		return // Image already present on host
+	}
+	ui.Detail("Pulling dependency image on host: %s", color.CyanString(img))
+	pullCmd := exec.CommandContext(ctx, "docker", "pull", img)
+	pullCmd.Stdout = os.Stdout
+	pullCmd.Stderr = os.Stderr
+	_ = pullCmd.Run()
+}
+
 func loadIntoMinikube(ctx context.Context, imageTag string) error {
-	// Use `minikube image load` which handles the transfer into minikube's
-	// Docker daemon running inside the VM/container.
+	// If it's a dependency image already present in minikube, skip to avoid slow re-loading
+	if !strings.HasPrefix(imageTag, "idlistack/") {
+		checkCmd := exec.CommandContext(ctx, "minikube", "image", "ls")
+		if out, err := checkCmd.Output(); err == nil {
+			lines := strings.Split(string(out), "\n")
+			for _, line := range lines {
+				trimmed := strings.TrimSpace(line)
+				if trimmed == imageTag || strings.HasSuffix(trimmed, "/"+imageTag) || strings.HasSuffix(trimmed, imageTag) {
+					ui.Detail("Image %s already present in minikube", color.HiBlackString(imageTag))
+					return nil
+				}
+			}
+		}
+	}
+
+	ui.Detail("Loading %s into minikube...", color.CyanString(imageTag))
 	loadCmd := exec.CommandContext(ctx, "minikube", "image", "load", imageTag)
 	loadCmd.Stdout = os.Stdout
 	loadCmd.Stderr = os.Stderr
