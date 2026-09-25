@@ -1,6 +1,7 @@
 const vscode = require('vscode');
 const path = require('path');
 const fs = require('fs');
+const os = require('os');
 
 /**
  * @param {vscode.ExtensionContext} context
@@ -8,16 +9,44 @@ const fs = require('fs');
 function activate(context) {
     console.log('IdliStack extension is now active!');
 
-    // Path to the bundled CLI binary
-    const cliPath = path.join(context.extensionPath, 'bin', 'idlistack');
+    // Path to the bundled CLI binary directory
+    const binDir = path.join(context.extensionPath, 'bin');
+    const cliPath = path.join(binDir, 'idlistack');
     
-    // Ensure it is executable
+    // 1. Ensure binary is executable (chmod +x)
     try {
         if (fs.existsSync(cliPath)) {
             fs.chmodSync(cliPath, 0o755);
         }
     } catch (e) {
         console.error('Failed to set execute permissions on CLI binary', e);
+    }
+
+    // 2. Automatically inject the extension bin directory into VS Code integrated terminals' PATH!
+    // This allows users to open any terminal inside VS Code and directly run `idlistack <command>`.
+    if (context.environmentVariableCollection) {
+        context.environmentVariableCollection.prepend('PATH', `${binDir}${path.delimiter}`);
+        context.environmentVariableCollection.description = 'IdliStack CLI binary path';
+    }
+
+    // 3. Symlink / copy to ~/.local/bin/idlistack for system-wide terminal access outside VS Code
+    try {
+        const localBin = path.join(os.homedir(), '.local', 'bin');
+        if (!fs.existsSync(localBin)) {
+            fs.mkdirSync(localBin, { recursive: true });
+        }
+        const userSymlink = path.join(localBin, 'idlistack');
+        if (!fs.existsSync(userSymlink)) {
+            try {
+                fs.symlinkSync(cliPath, userSymlink);
+            } catch (err) {
+                // If symlink fails (e.g. cross-filesystem), copy binary
+                fs.copyFileSync(cliPath, userSymlink);
+                fs.chmodSync(userSymlink, 0o755);
+            }
+        }
+    } catch (e) {
+        console.error('Failed to register ~/.local/bin/idlistack', e);
     }
 
     // Helper to get or create a terminal
@@ -125,12 +154,26 @@ function activate(context) {
         }
     });
 
-    // Persistent Status Bar Item
+    // Persistent Status Bar Item (Visible on startup)
     const statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 100);
     statusBarItem.text = '$(rocket) IdliStack';
     statusBarItem.tooltip = 'IdliStack: Zero-Config Deployment on K3s (Click for actions)';
     statusBarItem.command = 'idlistack.menu';
     statusBarItem.show();
+
+    // Welcome notification on first install
+    const welcomed = context.globalState.get('idlistack.welcomed_v1');
+    if (!welcomed) {
+        context.globalState.update('idlistack.welcomed_v1', true);
+        vscode.window.showInformationMessage(
+            'IdliStack is ready! Click $(rocket) IdliStack in the status bar or type "idlistack" in any new terminal.',
+            'Deploy to K3s',
+            'Inspect Stack'
+        ).then(selection => {
+            if (selection === 'Deploy to K3s') vscode.commands.executeCommand('idlistack.up');
+            if (selection === 'Inspect Stack') vscode.commands.executeCommand('idlistack.inspect');
+        });
+    }
 
     context.subscriptions.push(
         initDisposable,

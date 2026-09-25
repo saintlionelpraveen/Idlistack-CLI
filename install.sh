@@ -4,9 +4,9 @@
 # Supported Platforms: Ubuntu, Debian, Fedora, RHEL/Rocky/Alma, Windows (WSL2 / Git Bash)
 #
 # Automatically installs and configures:
-#   1. System utilities (curl, wget, ca-certificates, tar, iptables)
+#   1. System utilities (curl, wget, ca-certificates, tar, gzip, iptables)
 #   2. Docker Engine (with non-root user group permissions)
-#   3. K3s (Lightweight CNCF-certified Kubernetes cluster)
+#   3. K3s (Lightweight CNCF-certified Kubernetes cluster with self-healing)
 #   4. kubectl CLI (configured with user kubeconfig permissions)
 #   5. Helm v3 (Atomic Kubernetes package manager)
 #   6. K3s containerd socket permissions (for zero-registry image sideloading)
@@ -16,33 +16,33 @@
 
 set -euo pipefail
 
-# --- Color formatting ---
-BOLD="\033[1m"
-GREEN="\033[0;32m"
-CYAN="\033[0;36m"
-YELLOW="\033[1;33m"
-RED="\033[0;31m"
-NC="\033[0m" # No Color
+# --- Color formatting (ANSI C Quoting) ---
+BOLD=$'\033[1m'
+GREEN=$'\033[0;32m'
+CYAN=$'\033[0;36m'
+YELLOW=$'\033[1;33m'
+RED=$'\033[0;31m'
+NC=$'\033[0m' # No Color
 
 # --- Log Helpers ---
 log_info() {
-    printf "${CYAN}ℹ [INFO]${NC} %s\n" "$1"
+    printf "${CYAN}ℹ [INFO]${NC} %b\n" "$1"
 }
 
 log_step() {
-    printf "\n${BOLD}${CYAN}==>${NC} ${BOLD}%s${NC}\n" "$1"
+    printf "\n${BOLD}${CYAN}==>${NC} ${BOLD}%b${NC}\n" "$1"
 }
 
 log_success() {
-    printf "${GREEN}✔ [SUCCESS]${NC} %s\n" "$1"
+    printf "${GREEN}✔ [SUCCESS]${NC} %b\n" "$1"
 }
 
 log_warn() {
-    printf "${YELLOW}⚠ [WARNING]${NC} %s\n" "$1"
+    printf "${YELLOW}⚠ [WARNING]${NC} %b\n" "$1"
 }
 
 log_error() {
-    printf "${RED}✖ [ERROR]${NC} %s\n" "$1" >&2
+    printf "${RED}✖ [ERROR]${NC} %b\n" "$1" >&2
 }
 
 # --- Banner ---
@@ -149,18 +149,6 @@ handle_windows_host() {
     echo "    2. In Docker Desktop Settings -> Kubernetes -> check 'Enable Kubernetes'."
     echo "    3. IdliStack will automatically discover the 'docker-desktop' cluster context!"
     echo
-    if command -v powershell.exe >/dev/null 2>&1; then
-        read -r -p "Would you like to trigger 'wsl --install -d Ubuntu' now via PowerShell? [y/N]: " choice || true
-        case "$choice" in
-            [yY][eE][sS]|[yY])
-                powershell.exe -Command "Start-Process powershell -Verb RunAs -ArgumentList 'wsl --install -d Ubuntu'"
-                log_info "WSL2 installation launched in administrative PowerShell."
-                ;;
-            *)
-                log_info "Skipping automated WSL installation."
-                ;;
-        esac
-    fi
     exit 0
 }
 
@@ -188,18 +176,18 @@ install_core_dependencies() {
         debian)
             log_info "Updating package lists via apt-get..."
             run_as_root apt-get update -qq
-            run_as_root apt-get install -y -qq curl wget ca-certificates tar gzip iptables gnupg lsb-release sudo
+            run_as_root apt-get install -y -qq curl wget ca-certificates tar gzip iptables gnupg lsb-release sudo procps
             ;;
         fedora)
             log_info "Installing package dependencies via dnf..."
-            run_as_root dnf install -y -q curl wget ca-certificates tar gzip iptables systemd sudo
+            run_as_root dnf install -y -q curl wget ca-certificates tar gzip iptables systemd sudo procps-ng
             ;;
         arch)
             log_info "Installing package dependencies via pacman..."
-            run_as_root pacman -Sy --noconfirm curl wget ca-certificates tar gzip iptables sudo
+            run_as_root pacman -Sy --noconfirm curl wget ca-certificates tar gzip iptables sudo procps-ng
             ;;
         *)
-            log_warn "Unrecognized distribution (${OS_ID}). Attempting to proceed assuming curl, tar, and sudo exist..."
+            log_warn "Unrecognized distribution (${OS_ID}). Proceeding assuming utilities exist..."
             ;;
     esac
     log_success "System utilities are installed."
@@ -237,32 +225,84 @@ install_docker() {
     log_success "Docker Engine is active and configured for non-root usage."
 }
 
-# --- Step 3: Install K3s Kubernetes Cluster ---
+# --- Step 3: Install K3s Kubernetes Cluster (With Self-Healing) ---
 install_k3s() {
     log_step "Step 3/7: Installing K3s (Lightweight Kubernetes)"
 
-    # Check if a Kubernetes cluster already exists and is healthy
-    if command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1; then
-        log_info "Active Kubernetes cluster already detected via kubectl. Skipping K3s reinstallation."
+    # 1. Check if an active, healthy cluster is already running
+    if (command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1) || \
+       (command -v k3s >/dev/null 2>&1 && run_as_root k3s kubectl cluster-info >/dev/null 2>&1); then
+        log_info "Active Kubernetes cluster already detected and healthy. Skipping reinstallation."
         return 0
     fi
 
-    if command -v k3s >/dev/null 2>&1 && k3s kubectl cluster-info >/dev/null 2>&1; then
-        log_info "K3s is already installed and running."
-    else
-        log_info "Installing K3s with write-kubeconfig-mode 644..."
-        # Install K3s with readable kubeconfig permissions for local developer use
-        curl -sfL https://get.k3s.io | run_as_root sh -s - --write-kubeconfig-mode 644
+    # 2. Cleanup stale / broken previous installations before attempting install
+    log_info "Checking system environment and cleaning any stale K3s locks..."
+    if [ -f /usr/local/bin/k3s-killall.sh ]; then
+        run_as_root /usr/local/bin/k3s-killall.sh >/dev/null 2>&1 || true
+    fi
+    # Free port 6443 if an orphaned process is holding it
+    if command -v ss >/dev/null 2>&1 && ss -tlpn 2>/dev/null | grep -q ":6443 "; then
+        log_warn "Port 6443 is currently in use. Releasing port 6443..."
+        if command -v fuser >/dev/null 2>&1; then
+            run_as_root fuser -k 6443/tcp 2>/dev/null || true
+        fi
     fi
 
-    # Wait for node readiness
+    # Ubuntu 24.04+ AppArmor unprivileged user namespace fix
+    if [ -f /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]; then
+        log_info "Configuring AppArmor unprivileged user namespace allowance for containers..."
+        run_as_root sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 >/dev/null 2>&1 || true
+    fi
+
+    # 3. Install K3s
+    # Note: --disable traefik and --disable servicelb prevent conflicts on local developer laptops where
+    # ports 80/443 might be in use by local services. IdliStack uses native NodePorts (30000-32767).
+    log_info "Installing K3s with write-kubeconfig-mode 644 (Traefik disabled)..."
+    set +e
+    curl -sfL https://get.k3s.io | run_as_root env INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644 --disable traefik --disable servicelb" sh -
+    local k3s_exit=$?
+    set -e
+
+    # 4. Check if service started properly
+    local k3s_running=false
+    if [ $k3s_exit -eq 0 ] && command -v systemctl >/dev/null 2>&1; then
+        if systemctl is-active --quiet k3s 2>/dev/null; then
+            k3s_running=true
+        fi
+    fi
+
+    # 5. If failed to start, run automated diagnostics and recovery
+    if [ "$k3s_running" = false ]; then
+        log_warn "K3s service failed on initial start. Reading journalctl error logs..."
+        run_as_root journalctl -xeu k3s.service -n 25 --no-pager 2>/dev/null || true
+
+        log_info "Executing automated recovery: resetting stale database cache & restarting..."
+        if [ -f /usr/local/bin/k3s-killall.sh ]; then
+            run_as_root /usr/local/bin/k3s-killall.sh >/dev/null 2>&1 || true
+        fi
+        if command -v fuser >/dev/null 2>&1; then
+            run_as_root fuser -k 6443/tcp 2>/dev/null || true
+        fi
+        run_as_root rm -rf /var/lib/rancher/k3s/server/db /var/lib/rancher/k3s/data
+
+        # If host has Docker running and containerd had socket issues, use host Docker runtime (--docker)
+        if command -v docker >/dev/null 2>&1 && docker ps >/dev/null 2>&1; then
+            log_info "Configuring K3s to use host Docker runtime as reliable fallback (--docker)..."
+            curl -sfL https://get.k3s.io | run_as_root env INSTALL_K3S_EXEC="server --write-kubeconfig-mode 644 --disable traefik --disable servicelb --docker" sh -
+        else
+            run_as_root systemctl restart k3s 2>/dev/null || true
+        fi
+    fi
+
+    # 6. Wait for node readiness
     log_info "Waiting for K3s node to reach Ready state..."
     local attempts=0
     local max_attempts=30
     until run_as_root k3s kubectl get node 2>/dev/null | grep -q "Ready"; do
         attempts=$((attempts + 1))
         if [ "$attempts" -ge "$max_attempts" ]; then
-            log_warn "K3s is taking longer than expected to initialize. Proceeding..."
+            log_warn "K3s node initialization buffer reached. Continuing setup..."
             break
         fi
         sleep 2
@@ -368,18 +408,29 @@ install_railpack_and_cli() {
         fi
     fi
 
-    # 2. Install IdliStack CLI binary to /usr/local/bin if present in current directory
+    # 2. Install IdliStack CLI binary to /usr/local/bin
     local script_dir
     script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" >/dev/null 2>&1 && pwd)"
     if [ -f "${script_dir}/bin/idlistack" ]; then
-        log_info "Installing IdliStack CLI binary to /usr/local/bin/idlistack..."
+        log_info "Installing IdliStack CLI binary from local repo..."
         run_as_root cp "${script_dir}/bin/idlistack" /usr/local/bin/idlistack
         run_as_root chmod 0755 /usr/local/bin/idlistack
         log_success "IdliStack CLI installed globally to /usr/local/bin/idlistack."
     elif [ -f "${script_dir}/idlistack" ]; then
+        log_info "Installing IdliStack CLI binary from local repo..."
         run_as_root cp "${script_dir}/idlistack" /usr/local/bin/idlistack
         run_as_root chmod 0755 /usr/local/bin/idlistack
         log_success "IdliStack CLI installed globally to /usr/local/bin/idlistack."
+    else
+        log_info "Downloading compiled IdliStack CLI binary to /usr/local/bin/idlistack..."
+        local idli_url="https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/bin/idlistack"
+        if curl -fsSL "$idli_url" -o /tmp/idlistack 2>/dev/null; then
+            run_as_root mv /tmp/idlistack /usr/local/bin/idlistack
+            run_as_root chmod 0755 /usr/local/bin/idlistack
+            log_success "IdliStack CLI binary installed globally to /usr/local/bin/idlistack."
+        else
+            log_warn "Could not fetch standalone CLI binary. Note: The VS Code extension includes the CLI pre-bundled."
+        fi
     fi
 }
 
