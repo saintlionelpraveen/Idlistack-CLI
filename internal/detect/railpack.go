@@ -191,20 +191,28 @@ func DownloadRailpack(targetDir string, version string) (string, error) {
 	return finalBinPath, nil
 }
 
-// DetectWithRailpack executes railpack plan and parses the output into an IdliStack build plan
+// DetectWithRailpack executes railpack plan and parses the output into an IdliStack build plan.
+// If Railpack binary resolution, execution, or parsing fails or returns an empty plan,
+// it gracefully falls back to smart recursive heuristic detection so zero projects are left undetected.
 func DetectWithRailpack(ctx context.Context, projectDir string, cfg *config.Config, verbose bool) (*buildplan.Plan, error) {
 	bin, err := ResolveRailpackBinary()
-	if err != nil {
-		return nil, err
+	if err == nil {
+		cmd := exec.CommandContext(ctx, bin, "plan", projectDir)
+		output, cmdErr := cmd.Output()
+		if cmdErr == nil {
+			plan, parseErr := ParseRailpackPlan(output, projectDir, verbose)
+			if parseErr == nil && plan != nil && plan.Provider != "" {
+				return plan, nil
+			}
+		} else if verbose {
+			ui.Detail("Railpack plan note: %v", cmdErr)
+		}
+	} else if verbose {
+		ui.Detail("Railpack binary note: %v", err)
 	}
 
-	cmd := exec.CommandContext(ctx, bin, "plan", projectDir)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("railpack plan failed: %w", err)
-	}
-
-	return ParseRailpackPlan(output, projectDir, verbose)
+	// Smart deep heuristic recursive fallback inspection
+	return FallbackFileDetection(projectDir, verbose)
 }
 
 // ParseRailpackPlan parses Railpack 0.35+ and 0.39+ JSON output
@@ -542,8 +550,57 @@ func ParseRailpackPlan(data []byte, projectDir string, verbose bool) (*buildplan
 		}
 	}
 
+	// Auto-infer start command if missing
+	if plan.StartCmd == "" && plan.Provider != "" {
+		switch plan.Provider {
+		case "python":
+			if f := findFileRecursive(projectDir, "manage.py", 2); f != "" {
+				plan.StartCmd = "python manage.py runserver 0.0.0.0:8000"
+				plan.DetectedFramework = "django"
+			} else if f := findFileRecursive(projectDir, "app.py", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(rel))
+			} else if f := findFileRecursive(projectDir, "main.py", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(rel))
+			} else if f := findFileRecursive(projectDir, "server.py", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(rel))
+			} else if f := findFirstByExtension(projectDir, ".py", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(rel))
+			} else {
+				plan.StartCmd = "python main.py"
+			}
+		case "node":
+			if f := findFileRecursive(projectDir, "server.js", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+			} else if f := findFileRecursive(projectDir, "index.js", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+			} else if f := findFileRecursive(projectDir, "app.js", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+			} else if f := findFirstByExtension(projectDir, ".js", 2); f != "" {
+				rel, _ := filepath.Rel(projectDir, f)
+				plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+			} else {
+				plan.StartCmd = "node index.js"
+			}
+		case "php":
+			if findFileRecursive(projectDir, "artisan", 2) != "" {
+				plan.StartCmd = "php artisan serve --host=0.0.0.0 --port=80"
+			} else {
+				plan.StartCmd = "apache2-foreground"
+			}
+		case "static":
+			plan.StartCmd = "nginx -g 'daemon off;'"
+		}
+	}
+
 	if plan.Provider == "" && plan.StartCmd == "" {
-		return nil, fmt.Errorf("railpack returned empty plan")
+		return FallbackFileDetection(projectDir, verbose)
 	}
 
 	plan.Normalize()
@@ -566,4 +623,236 @@ func hasAnyExtension(dir, ext string) bool {
 		}
 	}
 	return false
+}
+
+// FallbackFileDetection performs deep recursive inspection across the project directory
+// to detect language, framework, start command, and port when Railpack plan is empty or fails.
+func FallbackFileDetection(projectDir string, verbose bool) (*buildplan.Plan, error) {
+	if projectDir == "" {
+		return nil, fmt.Errorf("project directory is empty")
+	}
+
+	plan := buildplan.NewDefaultPlan()
+	plan.DetectionSource = "heuristic"
+	plan.DetectionConfidence = "medium"
+
+	// 1. Check manifests (root and up to 2 subfolder levels)
+	pkgJSON := findFileRecursive(projectDir, "package.json", 2)
+	reqTxt := findFileRecursive(projectDir, "requirements.txt", 2)
+	pyProj := findFileRecursive(projectDir, "pyproject.toml", 2)
+	pipfile := findFileRecursive(projectDir, "Pipfile", 2)
+	setupPy := findFileRecursive(projectDir, "setup.py", 2)
+	compJSON := findFileRecursive(projectDir, "composer.json", 2)
+	goMod := findFileRecursive(projectDir, "go.mod", 2)
+	cargoToml := findFileRecursive(projectDir, "Cargo.toml", 2)
+	indexHTML := findFileRecursive(projectDir, "index.html", 2)
+	gemfile := findFileRecursive(projectDir, "Gemfile", 2)
+	pomXML := findFileRecursive(projectDir, "pom.xml", 2)
+
+	if pkgJSON != "" {
+		plan.Provider = "node"
+		plan.Stack = "node"
+		plan.Port = 3000
+		plan.InstallCmd = "npm install"
+		plan.StartCmd = "npm start"
+
+		relPkg, _ := filepath.Rel(projectDir, pkgJSON)
+		pkgDir := filepath.Dir(relPkg)
+
+		if data, err := os.ReadFile(pkgJSON); err == nil {
+			var pkg struct {
+				Main    string            `json:"main"`
+				Scripts map[string]string `json:"scripts"`
+			}
+			if json.Unmarshal(data, &pkg) == nil {
+				if pkg.Scripts != nil && pkg.Scripts["start"] != "" {
+					plan.StartCmd = "npm start"
+				} else if pkg.Main != "" {
+					plan.StartCmd = fmt.Sprintf("node %s", pkg.Main)
+				}
+			}
+		}
+
+		if pkgDir != "." && pkgDir != "" {
+			plan.InstallCmd = fmt.Sprintf("cd %s && %s", filepath.ToSlash(pkgDir), plan.InstallCmd)
+			plan.StartCmd = fmt.Sprintf("cd %s && %s", filepath.ToSlash(pkgDir), plan.StartCmd)
+		}
+	} else if reqTxt != "" || pyProj != "" || pipfile != "" || setupPy != "" || hasAnyExtensionRecursive(projectDir, ".py", 3) {
+		plan.Provider = "python"
+		plan.Stack = "python"
+		plan.Port = 8000
+		if reqTxt != "" {
+			relReq, _ := filepath.Rel(projectDir, reqTxt)
+			plan.InstallCmd = fmt.Sprintf("pip install -r %s", filepath.ToSlash(relReq))
+		}
+		if findFileRecursive(projectDir, "manage.py", 2) != "" {
+			plan.StartCmd = "python manage.py runserver 0.0.0.0:8000"
+			plan.DetectedFramework = "django"
+		} else if findFileRecursive(projectDir, "app.py", 2) != "" {
+			relApp, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "app.py", 2))
+			plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(relApp))
+		} else if findFileRecursive(projectDir, "main.py", 2) != "" {
+			relMain, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "main.py", 2))
+			plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(relMain))
+		} else if findFileRecursive(projectDir, "server.py", 2) != "" {
+			relServer, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "server.py", 2))
+			plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(relServer))
+		} else if f := findFirstByExtension(projectDir, ".py", 3); f != "" {
+			relPy, _ := filepath.Rel(projectDir, f)
+			plan.StartCmd = fmt.Sprintf("python %s", filepath.ToSlash(relPy))
+		} else {
+			plan.StartCmd = "python main.py"
+		}
+	} else if compJSON != "" || hasAnyExtensionRecursive(projectDir, ".php", 3) {
+		plan.Provider = "php"
+		plan.Stack = "php"
+		plan.Port = 80
+		if findFileRecursive(projectDir, "artisan", 2) != "" {
+			plan.DetectedFramework = "laravel"
+			plan.StartCmd = "php artisan serve --host=0.0.0.0 --port=80"
+		} else {
+			plan.StartCmd = "apache2-foreground"
+		}
+	} else if goMod != "" || hasAnyExtensionRecursive(projectDir, ".go", 3) {
+		plan.Provider = "go"
+		plan.Stack = "go"
+		plan.Port = 8080
+		plan.BuildCmd = "go build -o app ."
+		plan.StartCmd = "./app"
+	} else if cargoToml != "" || hasAnyExtensionRecursive(projectDir, ".rs", 3) {
+		plan.Provider = "rust"
+		plan.Stack = "rust"
+		plan.Port = 8080
+		plan.BuildCmd = "cargo build --release"
+		plan.StartCmd = "./target/release/app"
+	} else if gemfile != "" || hasAnyExtensionRecursive(projectDir, ".rb", 3) {
+		plan.Provider = "ruby"
+		plan.Stack = "ruby"
+		plan.Port = 3000
+		plan.StartCmd = "bundle exec rackup -o 0.0.0.0 -p 3000"
+	} else if pomXML != "" || hasAnyExtensionRecursive(projectDir, ".java", 3) {
+		plan.Provider = "java"
+		plan.Stack = "java"
+		plan.Port = 8080
+		plan.StartCmd = "java -jar target/*.jar"
+	} else if hasAnyExtensionRecursive(projectDir, ".js", 3) || hasAnyExtensionRecursive(projectDir, ".ts", 3) || hasAnyExtensionRecursive(projectDir, ".mjs", 3) {
+		plan.Provider = "node"
+		plan.Stack = "node"
+		plan.Port = 3000
+		if findFileRecursive(projectDir, "server.js", 2) != "" {
+			rel, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "server.js", 2))
+			plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+		} else if findFileRecursive(projectDir, "index.js", 2) != "" {
+			rel, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "index.js", 2))
+			plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+		} else if findFileRecursive(projectDir, "app.js", 2) != "" {
+			rel, _ := filepath.Rel(projectDir, findFileRecursive(projectDir, "app.js", 2))
+			plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+		} else if f := findFirstByExtension(projectDir, ".js", 3); f != "" {
+			rel, _ := filepath.Rel(projectDir, f)
+			plan.StartCmd = fmt.Sprintf("node %s", filepath.ToSlash(rel))
+		} else {
+			plan.StartCmd = "node index.js"
+		}
+	} else if indexHTML != "" || hasAnyExtensionRecursive(projectDir, ".html", 3) || hasAnyExtensionRecursive(projectDir, ".htm", 3) {
+		plan.Provider = "static"
+		plan.Stack = "static"
+		plan.Port = 80
+		plan.StartCmd = "nginx -g 'daemon off;'"
+	}
+
+	if plan.Provider == "" {
+		return nil, fmt.Errorf("no recognizable project files found")
+	}
+
+	if verbose {
+		ui.Detail("Inferred provider via deep heuristic scan: %s (%s)", plan.Provider, plan.StartCmd)
+	}
+
+	plan.Normalize()
+	return plan, nil
+}
+
+func isIgnoredDir(name string) bool {
+	switch name {
+	case ".git", ".idlistack", "node_modules", "venv", ".venv", "target", "dist", "__pycache__", ".pytest_cache", ".mypy_cache":
+		return true
+	default:
+		return false
+	}
+}
+
+func findFileRecursive(root, targetName string, maxDepth int) string {
+	var result string
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || result != "" {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			if isIgnoredDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			rel, _ := filepath.Rel(root, p)
+			if strings.Count(rel, string(os.PathSeparator)) > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if info.Name() == targetName {
+			result = p
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return result
+}
+
+func findFirstByExtension(root, ext string, maxDepth int) string {
+	var result string
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || result != "" {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			if isIgnoredDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			rel, _ := filepath.Rel(root, p)
+			if strings.Count(rel, string(os.PathSeparator)) > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(info.Name(), ext) {
+			result = p
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return result
+}
+
+func hasAnyExtensionRecursive(root, ext string, maxDepth int) bool {
+	var found bool
+	_ = filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || found {
+			return filepath.SkipDir
+		}
+		if info.IsDir() {
+			if isIgnoredDir(info.Name()) {
+				return filepath.SkipDir
+			}
+			rel, _ := filepath.Rel(root, p)
+			if strings.Count(rel, string(os.PathSeparator)) > maxDepth {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if strings.HasSuffix(info.Name(), ext) {
+			found = true
+			return filepath.SkipDir
+		}
+		return nil
+	})
+	return found
 }

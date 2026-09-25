@@ -118,6 +118,15 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			layer05Plan.Normalize()
 			return layer05Plan, nil
 		}
+		// Fallback: build directly using the configured provider
+		configPlan := buildplan.NewDefaultPlan()
+		configPlan.Provider = cfg.Build.Provider
+		configPlan.Stack = cfg.Build.Provider
+		configPlan.DetectionSource = "config"
+		configPlan.DetectionConfidence = "high"
+		applyConfigOverrides(configPlan, cfg)
+		configPlan.Normalize()
+		return configPlan, nil
 	}
 
 	// Layer 0.5: Dynamic Rules Detection
@@ -157,6 +166,17 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 		applyConfigOverrides(layer3Plan, cfg)
 		layer3Plan.Normalize()
 		return layer3Plan, nil
+	}
+
+	// ─── Layer 4: Deep heuristic recursive fallback (Safety net) ────
+	layer4Plan, err4 := FallbackFileDetection(projectDir, verbose)
+	if layer4Plan != nil && err4 == nil {
+		if verbose {
+			ui.Detail("Detected by heuristic fallback: %s (%s)", layer4Plan.Stack, layer4Plan.StartCmd)
+		}
+		applyConfigOverrides(layer4Plan, cfg)
+		layer4Plan.Normalize()
+		return layer4Plan, nil
 	}
 
 	return nil, fmt.Errorf("could not detect application type. Create a Dockerfile or ensure your project has a recognizable structure")

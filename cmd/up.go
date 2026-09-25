@@ -476,6 +476,9 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	}
 
 	// Copy from builder
+	if plan.Provider == "python" {
+		df.WriteString("COPY --from=builder /usr/local /usr/local\n")
+	}
 	df.WriteString(fmt.Sprintf("COPY --from=builder %s %s\n", workdir, workdir))
 
 	if plan.Provider == "php" {
@@ -498,10 +501,14 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	if plan.Provider == "php" && (plan.StartCmd == "/entrypoint.sh" || plan.StartCmd == "" || plan.StartCmd == "/start-container.sh") {
 		// Apache handles startup natively (apache2-foreground)
 	} else if plan.StartCmd != "" && !isPlaceholderCmd(plan.StartCmd) && !strings.Contains(plan.StartCmd, "start-container.sh") {
-		// Split start command for CMD array
-		parts := strings.Fields(plan.StartCmd)
-		cmdJSON, _ := json.Marshal(parts)
-		df.WriteString(fmt.Sprintf("CMD %s\n", string(cmdJSON)))
+		if strings.ContainsAny(plan.StartCmd, "&|;><$") || strings.Contains(plan.StartCmd, "cd ") {
+			cmdJSON, _ := json.Marshal([]string{"sh", "-c", plan.StartCmd})
+			df.WriteString(fmt.Sprintf("CMD %s\n", string(cmdJSON)))
+		} else {
+			parts := strings.Fields(plan.StartCmd)
+			cmdJSON, _ := json.Marshal(parts)
+			df.WriteString(fmt.Sprintf("CMD %s\n", string(cmdJSON)))
+		}
 	}
 
 	// Write generated Dockerfile
