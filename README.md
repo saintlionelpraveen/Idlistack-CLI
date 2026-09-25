@@ -201,10 +201,10 @@ NODE_ENV = "production"
 ---
 ## Local steps to setup
 
-# 1. One-Line Setup (Remote or from GitHub)
+### 1. One-Line Setup (Remote or from GitHub)
 curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
 
-# 2. Local Setup (From Cloned Repo)
+### 2. Local Setup (From Cloned Repo)
 chmod +x ./install.sh
 ./install.sh
 
