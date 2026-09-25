@@ -707,11 +707,57 @@ func loadImageIntoCluster(ctx context.Context, imageTag string) (ClusterRuntime,
 	}
 }
 
+func ensureK3sRunning(ctx context.Context) error {
+	// 1. Quick check: is K3s containerd socket responsive?
+	checkDirect := exec.CommandContext(ctx, "k3s", "ctr", "c", "ls")
+	if checkDirect.Run() == nil {
+		return nil
+	}
+	checkSudo := exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "c", "ls")
+	if checkSudo.Run() == nil {
+		return nil
+	}
+
+	ui.Warn("K3s cluster is not responding. Starting K3s (sudo systemctl start k3s)...")
+
+	// 2. Try starting k3s service
+	startSudoN := exec.CommandContext(ctx, "sudo", "-n", "systemctl", "start", "k3s")
+	if startSudoN.Run() != nil {
+		startDirect := exec.CommandContext(ctx, "systemctl", "start", "k3s")
+		if startDirect.Run() != nil {
+			startInteractive := exec.CommandContext(ctx, "sudo", "systemctl", "start", "k3s")
+			startInteractive.Stdin = os.Stdin
+			startInteractive.Stdout = os.Stdout
+			startInteractive.Stderr = os.Stderr
+			_ = startInteractive.Run()
+		}
+	}
+
+	// 3. Wait up to 15 seconds for containerd socket to be ready
+	for i := 0; i < 15; i++ {
+		time.Sleep(1 * time.Second)
+		if exec.CommandContext(ctx, "k3s", "ctr", "c", "ls").Run() == nil {
+			ui.Success("K3s cluster is active and ready.")
+			return nil
+		}
+		if exec.CommandContext(ctx, "sudo", "-n", "k3s", "ctr", "c", "ls").Run() == nil {
+			ui.Success("K3s cluster is active and ready.")
+			return nil
+		}
+	}
+
+	return fmt.Errorf("K3s cluster is stopped. Start it with: sudo systemctl start k3s")
+}
+
 func loadIntoK3s(ctx context.Context, imageTag string) error {
 	// If it's a pre-built public registry image, K3s containerd will pull it directly
 	if !strings.HasPrefix(imageTag, "idlistack/") {
 		ui.Detail("K3s containerd will use/pull %s directly", color.CyanString(imageTag))
 		return nil
+	}
+
+	if err := ensureK3sRunning(ctx); err != nil {
+		return err
 	}
 
 	tarPath := fmt.Sprintf("/tmp/idlistack-%d.tar", time.Now().UnixNano())
@@ -740,7 +786,10 @@ func loadIntoK3s(ctx context.Context, imageTag string) error {
 	importCmd.Stdin = os.Stdin
 	importCmd.Stdout = os.Stdout
 	importCmd.Stderr = os.Stderr
-	return importCmd.Run()
+	if err := importCmd.Run(); err != nil {
+		return fmt.Errorf("failed to import image into K3s: %w (Ensure K3s is running: sudo systemctl start k3s)", err)
+	}
+	return nil
 }
 
 func ensureHostDockerImage(ctx context.Context, img string) {

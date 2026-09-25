@@ -232,7 +232,10 @@ install_k3s() {
     # 1. Check if an active, healthy cluster is already running
     if (command -v kubectl >/dev/null 2>&1 && kubectl cluster-info >/dev/null 2>&1) || \
        (command -v k3s >/dev/null 2>&1 && run_as_root k3s kubectl cluster-info >/dev/null 2>&1); then
-        log_info "Active Kubernetes cluster already detected and healthy. Skipping reinstallation."
+        log_info "Active Kubernetes cluster already detected and healthy."
+        if command -v systemctl >/dev/null 2>&1; then
+            run_as_root systemctl enable --now k3s >/dev/null 2>&1 || true
+        fi
         return 0
     fi
 
@@ -356,8 +359,8 @@ configure_sideload_permissions() {
     local sudoers_file="/etc/sudoers.d/idlistack-k3s"
     log_info "Adding passwordless sudoers rule for K3s containerd image imports..."
     run_as_root tee "$sudoers_file" > /dev/null << EOF
-# Allow ${TARGET_USER} to import sideloaded container images into K3s containerd without password
-${TARGET_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/k3s ctr images import *, /usr/bin/k3s ctr images import *
+# Allow ${TARGET_USER} to import sideloaded container images and manage K3s service without password
+${TARGET_USER} ALL=(ALL) NOPASSWD: /usr/local/bin/k3s ctr images import *, /usr/bin/k3s ctr images import *, /bin/systemctl start k3s, /usr/bin/systemctl start k3s, /bin/systemctl restart k3s, /usr/bin/systemctl restart k3s, /bin/systemctl status k3s, /usr/bin/systemctl status k3s, /bin/systemctl is-active k3s, /usr/bin/systemctl is-active k3s
 EOF
     run_as_root chmod 0440 "$sudoers_file"
 
