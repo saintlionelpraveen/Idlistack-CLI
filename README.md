@@ -1,546 +1,214 @@
-# IdliStack CLI — Architecture & Reference
+# IdliStack CLI & VS Code Extension
 
-> **Deploy any application with zero configuration.**
-> Built by **T4GC** · Written in Go · Deploys to Kubernetes
+> **Deploy any application to Kubernetes with zero configuration.**
+> Powered by **Go**, **Railpack (BuildKit)**, **Docker**, **Helm**, and **K3s**.
 
 ---
 
 ## Overview
 
-IdliStack is a production-grade deployment CLI that automatically **detects** your application's language, framework, runtime version, and dependencies — then **builds** an OCI-compliant container image and **deploys** it to Kubernetes — all with a single command.
+**IdliStack** brings the developer experience of modern platforms (Railway, Render, Vercel) directly to your local or edge Kubernetes clusters (**K3s**, **Minikube**, **Kind**, or **Docker Desktop**).
 
-```
+With a single command or one click in VS Code, IdliStack:
+1. **Detects** your language, framework, runtime version, and dependencies.
+2. **Compiles** an optimized OCI container image via **Railpack** using BuildKit caching.
+3. **Sideloads** the image directly into your local cluster containerd without public registry delays.
+4. **Provisions** database and cache sidecars (**PostgreSQL**, **MariaDB/MySQL**, **Redis**) and persistent storage (PVCs).
+5. **Deploys** atomically using native **Helm** charts with TCP health probes and auto-rollback protection.
+
+```bash
+# Detect, build, and deploy in one command
 idlistack up
 ```
 
-No Dockerfile required. No Kubernetes YAML to write. No CI/CD pipeline to configure.
+---
+
+## Key Features
+
+- **Zero Configuration:** No Dockerfile or Kubernetes YAML needed.
+- **Powered by Railpack v0.39+:** Builds OCI-compliant images using Railway's modern BuildKit engine.
+- **Zero-Install Client Resilience:** The user does not need to install Railpack manually. IdliStack's standalone resolver automatically resolves it, with a built-in multi-stage Dockerfile generator as an offline fallback.
+- **Automated Databases & Caches:** Auto-provisions PostgreSQL, MariaDB/MySQL (with `init.sql`), and Redis with persistent volumes.
+- **Deterministic Traffic Routing:** Calculates collision-free NodePorts (`30000-32767`) and outputs clickable local URLs (`http://127.0.0.1:<port>`).
+- **Interactive Web Dashboard (`idlistack status`):** Embedded web console featuring live log streaming, real-time CPU/memory metrics, container shell, 1-click database SQL backups, and Helm rollbacks.
+- **VS Code Extension:** One-click deployment directly from the status bar, command palette, or file context menu.
 
 ---
 
 ## Technology Stack
 
-| Component | Technology | Purpose |
-|-----------|-----------|---------|
-| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) | Command parsing, flags, help text |
-| **Configuration** | [TOML](https://toml.io) via BurntSushi/toml | Human-readable project config (`idlistack.toml`) |
-| **Detection Engine** | Custom built-in detector | Language, framework, version, and command inference |
-| **Image Build** | [Docker Engine](https://docs.docker.com/engine/) | OCI image builds from generated Dockerfiles |
-| **Container Runtime** | [Minikube](https://minikube.sigs.k8s.io/) | Local Kubernetes cluster (dev environment) |
-| **Orchestration** | [Kubernetes](https://kubernetes.io/) via `kubectl` | Deployment, services, health checks, rollouts |
-| **Terminal UI** | [fatih/color](https://github.com/fatih/color) | Colored, structured CLI output |
-| **Language** | Go 1.26 | Single binary, cross-platform, zero runtime deps |
+| Component | Technology | Role & Purpose |
+| :--- | :--- | :--- |
+| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Command parsing, flags, and terminal UI |
+| **Primary Build Engine** | [Railpack](https://railpack.com) (v0.39+) | BuildKit image compilation with multi-tier caching |
+| **Detection Engine** | Railpack + Dynamic Rules | Stack, runtime version, and start command inference |
+| **Cluster Runtime** | [K3s](https://k3s.io) (containerd) | Production-grade local Kubernetes distribution |
+| **Orchestrator** | [Helm v3](https://helm.sh) | Atomic upgrades, rollbacks, and manifest templating |
+| **Terminal UI** | [fatih/color](https://github.com/fatih/color) | Clean, colored, structured CLI output |
 
 ---
 
-## Pipeline Architecture
+## Quick Start
 
-IdliStack executes a **6-step pipeline** every time you run `idlistack up`:
+### 1. Automated Prerequisites & CLI Installation
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                     idlistack up                                │
-├──────────┬──────────┬──────────┬──────────┬──────────┬──────────┤
-│  Step 1  │  Step 2  │  Step 3  │  Step 4  │  Step 5  │  Step 6  │
-│ Validate │  Detect  │  Plan    │  Build   │  Load    │  Deploy  │
-│ Project  │  App     │  Save    │  OCI     │  Image   │  to K8s  │
-└──────────┴──────────┴──────────┴──────────┴──────────┴──────────┘
-```
+You can automatically set up **Docker**, **K3s Kubernetes**, **Kubectl**, **Helm v3**, non-root permissions, and the **IdliStack CLI** with our production-ready installer:
 
-Each step is described in detail below.
-
----
-
-## Step 1 — Validate Project
-
-**What it does:**
-- Reads `idlistack.toml` from the current directory
-- Validates that the project has been initialized
-- Calculates the source directory size (excluding ignored paths)
-- Enforces a dynamic size limit (current size + 500 MB buffer)
-
-**Files read:**
-- `idlistack.toml` — Project configuration
-- `.idlistackignore` — Custom ignore patterns
-- `.gitignore` — Fallback ignore patterns
-
-**Default ignore patterns:**
-```
-.git, .idlistack, node_modules, __pycache__, .next, dist, build,
-.venv, venv, target, vendor, .cargo, .gradle
-```
-
----
-
-## Step 2 — Detect Application
-
-The detection engine is the core intelligence of IdliStack. It identifies **what** your project is and **how** to build and run it — without any user input.
-
-### Detection Layers
-
-```
-┌───────────────────────────────────────┐
-│  Layer 0: Existing Dockerfile         │  ← Highest priority
-│  If Dockerfile exists, use it as-is   │
-├───────────────────────────────────────┤
-│  Layer 1: Built-in Smart Detector     │  ← Primary detection
-│  Scans project files to identify      │
-│  language, framework, version, port   │
-└───────────────────────────────────────┘
-```
-
-### Layer 0 — Dockerfile Detection
-
-If a `Dockerfile` exists in the project root, IdliStack uses it directly without generating anything. It also parses the `EXPOSE` directive to auto-detect the application port.
-
-### Layer 1 — Built-in Smart Detector
-
-The built-in detector walks the source tree and matches **signal files** against a prioritized list of framework signatures.
-
-#### Supported Languages & Frameworks
-
-| Language | Frameworks | Signal Files |
-|----------|-----------|-------------|
-| **Node.js** | Next.js, Nuxt, Remix, SvelteKit, Astro, Vite, Angular, Gatsby, Ember, Vue, Ghost | `next.config.js`, `nuxt.config.ts`, `vite.config.ts`, `.ghost-cli`, etc. |
-| **Python** | Django, Flask, FastAPI, Frappe | `manage.py`, `app.py`, `main.py`, `sites/common_site_config.json` |
-| **Go** | Standard Go | `go.mod` |
-| **Rust** | Cargo projects | `Cargo.toml` |
-| **Ruby** | Rails, Rack | `Gemfile`, `config.ru` |
-| **Java** | Maven, Gradle | `pom.xml`, `build.gradle`, `build.gradle.kts` |
-| **PHP** | Laravel, Composer | `artisan`, `composer.json` |
-| **.NET** | C#, F# | `*.csproj`, `*.fsproj` |
-| **Elixir** | Phoenix | `mix.exs` |
-| **Deno** | Deno | `deno.json`, `deno.jsonc` |
-| **Bun** | Bun | `bun.lockb`, `bunfig.toml` |
-| **Static** | HTML/CSS/JS | `index.html` |
-
-#### Dynamic Runtime Version Detection
-
-IdliStack **never hardcodes runtime versions**. It dynamically reads them from your project files, framework metadata, and system runtimes — in priority order:
-
-**Node.js** version sources:
-1. `.nvmrc`
-2. `.node-version`
-3. `package.json` → `engines.node`
-4. Framework-specific (e.g., Ghost: `versions/<ver>/package.json` → `engines.node`)
-5. System fallback: `node --version`
-
-**Python** version sources:
-1. `.python-version`
-2. `runtime.txt`
-3. `pyproject.toml` → `requires-python`
-4. `Pipfile` → `python_version`
-5. System fallback: `python3 --version`
-
-**Go** version sources:
-1. `go.mod` → `go X.Y`
-2. System fallback: `go --version`
-
-**Ruby** version sources:
-1. `.ruby-version`
-2. `Gemfile` → `ruby 'X.Y.Z'`
-3. System fallback: `ruby --version`
-
-**Java** version sources:
-1. `.java-version`
-2. `pom.xml` → `<java.version>` or `<maven.compiler.source>`
-3. `build.gradle` / `build.gradle.kts` → `sourceCompatibility`
-4. System fallback: `java --version`
-
-**Rust** version sources:
-1. `rust-toolchain.toml` → `channel`
-2. `rust-toolchain` (plain file)
-3. System fallback: `rustc --version`
-
-**PHP** version sources:
-1. `composer.json` → `require.php` or `config.platform.php`
-2. System fallback: `php --version`
-
-**Elixir** version sources:
-1. `mix.exs` → `elixir: "~> X.Y"`
-2. `.tool-versions` (asdf)
-3. System fallback: `elixir --version`
-
-**.NET** version sources:
-1. `global.json` → `sdk.version`
-2. `*.csproj` → `<TargetFramework>netX.Y</TargetFramework>`
-3. System fallback: `dotnet --version`
-
-#### Command Inference
-
-After detecting the language and framework, IdliStack infers the install, build, and start commands:
-
-| Framework | Install | Build | Start | Port |
-|-----------|---------|-------|-------|------|
-| Next.js | `npm install` | `npm run build` | `npm start` | 3000 |
-| Ghost | `npm install -g ghost-cli@latest` | — | `ghost run` | 2368 |
-| Django | `pip install -r requirements.txt` | — | `python manage.py runserver 0.0.0.0:8000` | 8000 |
-| FastAPI | `pip install -r requirements.txt` | — | `uvicorn main:app --host 0.0.0.0 --port 8000` | 8000 |
-| Rails | `bundle install` | — | `rails server -b 0.0.0.0 -p 3000` | 3000 |
-| Go | — | `go build -o app .` | `./app` | 8080 |
-| Maven | — | `mvn clean package -DskipTests` | `java -jar target/*.jar` | 8080 |
-| Laravel | `composer install` | — | `php artisan serve --host=0.0.0.0 --port=8000` | 8000 |
-| Phoenix | `mix deps.get` | `mix compile` | `mix phx.server` | 4000 |
-
-All inferred values can be **overridden** in `idlistack.toml`.
-
----
-
-## Step 3 — Generate Build Plan
-
-The detection results are saved as a **build plan** — a JSON file at `.idlistack/buildplan.json`.
-
-```json
-{
-  "planVersion": "1",
-  "provider": "node",
-  "runtime": "22",
-  "detectedFramework": "ghost",
-  "installCmd": "npm install -g ghost-cli@latest",
-  "startCmd": "ghost run",
-  "port": 2368,
-  "healthCheck": { "path": "/health", "interval": 30, "timeout": 5 },
-  "resources": { "memory": "512Mi", "cpu": "250m" },
-  "detectionConfidence": "medium",
-  "detectionSource": "layer2-builtin"
-}
-```
-
-You can preview the plan without building by running:
 ```bash
+# Automated install for Ubuntu, Debian, Fedora, RHEL, and Windows (WSL2):
+curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
+```
+
+Or from a local clone:
+
+```bash
+# Clone the repository
+git clone https://github.com/saintlionelpraveen/Idlistack-CLI.git
+cd Idlistack-CLI
+
+# Run the automated prerequisites & environment installer
+./install.sh
+
+# Or build manually with Go:
+make install
+```
+
+Make sure `~/.local/bin` (or `/usr/local/bin`) is in your `PATH`.
+
+---
+
+### 2. Basic Usage
+
+Navigate to any application directory (Node.js, Python, Go, PHP, Rust, Ruby, etc.):
+
+```bash
+# 1. Preview the build plan without building or deploying
 idlistack up --inspect
+
+# 2. Build and deploy to Kubernetes
+idlistack up
+
+# 3. View live pod logs
+idlistack logs
+
+# 4. Check cluster status & open interactive Web Dashboard
+idlistack status
+
+# 5. Manage runtime secrets and environment variables
+idlistack env set API_KEY="secret-token"
+idlistack env list
+
+# 6. Tear down deployment and clean cluster resources
+idlistack down
 ```
 
 ---
 
-## Step 4 — Build OCI Image
-
-IdliStack builds a standard OCI-compliant container image using **Docker Engine**.
-
-### Build Strategy
+## The 6-Stage Pipeline
 
 ```
-┌──────────────────────────────────────────┐
-│  Does the project have a Dockerfile?     │
-│                                          │
-│   YES → Use it directly                  │
-│                                          │
-│   NO  → Generate an optimized            │
-│          Dockerfile from the build plan  │
-└──────────────────────────────────────────┘
+[1. Validate Project] ──> [2. Detect Application] ──> [3. Save Build Plan]
+                                                              │
+[6. Helm K8s Rollout] <── [5. Sideload to Cluster] <── [4. Build OCI Image]
 ```
 
-### Generated Dockerfile
-
-When no Dockerfile exists, IdliStack generates one at `.idlistack/Dockerfile.generated`:
-
-```dockerfile
-FROM node:22-alpine        # ← Base image from detected runtime
-WORKDIR /app
-COPY . .
-RUN npm install -g ghost-cli@latest   # ← install command
-EXPOSE 2368                           # ← detected port
-CMD ["ghost","run"]                   # ← start command
-```
-
-### Base Image Resolution
-
-The base image is selected based on the detected provider and runtime version. When no version is detected, Docker's **rolling aliases** are used so images never go stale:
-
-| Provider | Detected Version | Base Image |
-|----------|-----------------|------------|
-| Node.js | `22` | `node:22-alpine` |
-| Node.js | *(none)* | `node:lts-alpine` |
-| Python | `3.12` | `python:3.12-slim` |
-| Python | *(none)* | `python:3-slim` |
-| Go | `1.26` | `golang:1.26-alpine` |
-| Go | *(none)* | `golang:1-alpine` |
-| Rust | `1.78` | `rust:1.78` |
-| Ruby | `3.3` | `ruby:3.3-slim` |
-| Java | `21` | `eclipse-temurin:21-jdk-alpine` |
-| PHP | `8.2` | `php:8.2-cli` |
-| .NET | `8.0` | `mcr.microsoft.com/dotnet/sdk:8.0` |
-| Deno | — | `denoland/deno:latest` |
-| Bun | — | `oven/bun:latest` |
-| Static | — | `nginx:alpine` |
-
-### Build Context Optimization
-
-A `.dockerignore` is auto-generated (if missing) to exclude heavy directories from the Docker build context:
-
-```
-.git, .idlistack, node_modules, __pycache__, .next, dist, build,
-.venv, venv, target, vendor, .cargo, .gradle, *.sock
-```
-
-### Image Tagging
-
-Images are tagged as:
-```
-idlistack/<project-name>:<unix-timestamp>
-```
-Example: `idlistack/ghost:1786085692`
+1. **Validate Project & Sizing:** Checks `idlistack.toml`, calculates source directory size with `.idlistackignore` / `.gitignore` filtering, and enforces memory ceilings.
+2. **Detect Application:** Scans codebase in priority order:
+   - *Layer 0:* Existing `Dockerfile` / `docker-compose.yml` (user-provided).
+   - *Layer 0.5:* Specialized Dynamic Rules (Ghost CMS, Frappe Bench).
+   - *Layer 1:* **Railpack Detection Engine** (Node, Python, Go, Rust, PHP, Java, Ruby, Elixir, .NET, Deno, Bun).
+   - *Layer 2:* Nixpacks Fallback.
+   - *Layer 3:* Gemini AI Fallback.
+3. **Save Build Plan:** Normalizes runtime, build commands, and ports into `.idlistack/buildplan.json`.
+4. **Build OCI Image:** Compiles image via `railpack build` with BuildKit layer caching (or native multi-stage Dockerfile fallback).
+5. **Sideload to Cluster:** Saves and imports images directly into K3s containerd (`k3s ctr images import`) or Minikube/Kind.
+6. **Deploy to Kubernetes via Helm:** Scaffolds Helm chart, provisions companion databases/PVCs, configures TCP socket health probes (150s startup window), and executes atomic upgrade with auto-rollback.
 
 ---
 
-## Step 5 — Load Image into Minikube
+## Interactive Web Dashboard (`idlistack status`)
 
-The built image is loaded directly into Minikube's internal Docker daemon:
+Running `idlistack status` starts an embedded Go HTTP/SSE server on `http://127.0.0.1:4200` with:
+- **Live Metrics:** Real-time container CPU & Memory graphs.
+- **In-Browser Shell:** Execute commands directly in your running pods.
+- **Secrets Editor:** Live CRUD for environment variables with zero-downtime rolling restart.
+- **1-Click SQL Backup:** Instant streaming download of full database SQL dumps.
+- **Deployment History & Rollback:** View past Helm releases and roll back in one click.
+
+---
+
+## VS Code Extension
+
+An official Visual Studio Code extension is located in [`vscode-extension/`](vscode-extension/):
+
+- **Package:** `vscode-extension/idlistack-vscode-1.7.0.vsix`
+- **Commands:**
+  - `IdliStack: Deploy to K3s (Up)`
+  - `IdliStack: Inspect Stack & Plan`
+  - `IdliStack: Check Cluster Status`
+  - `IdliStack: View Logs`
+  - `IdliStack: Destroy (Down)`
+- **Persistent Status Bar:** Click **`$(rocket) IdliStack`** in the status bar for instant deployment actions.
+
+### Installing in VS Code
 
 ```bash
-minikube image load idlistack/ghost:1786085692
+code --install-extension vscode-extension/idlistack-vscode-1.7.0.vsix
 ```
 
-This avoids needing a container registry for local development. The Kubernetes manifests use `imagePullPolicy: Never` to reference the locally loaded image.
-
 ---
 
-## Step 6 — Deploy to Kubernetes
+## Configuration (`idlistack.toml`)
 
-IdliStack generates and applies Kubernetes manifests for:
-
-### Resources Created
-
-| Resource | Purpose |
-|----------|---------|
-| **Namespace** | `idlistack-<project>` — isolates the project |
-| **Deployment** | Manages pods with the built image |
-| **Service** | `NodePort` service for external access |
-| **Secret** *(optional)* | Environment variables set via `idlistack env set` |
-
-### Name Sanitization
-
-All Kubernetes resource names are sanitized to comply with **RFC 1123 DNS labels**:
-- Lowercased
-- Spaces and underscores replaced with hyphens
-- Non-alphanumeric characters stripped
-- Leading/trailing hyphens removed
-
-Example: `My_App v2` → `my-app-v2`
-
-### Health Checks
-
-Every deployment includes three probes using **TCP socket checks** (works with any application, no `/health` endpoint required):
-
-| Probe | Purpose | Config |
-|-------|---------|--------|
-| **Startup** | Gives the app time to boot | 5s delay, 5s interval, 30 retries (up to 150s) |
-| **Liveness** | Restarts crashed containers | 15s interval, 3 retries |
-| **Readiness** | Controls traffic routing | 5s interval, 3 retries |
-
-### Rollout & Rollback
-
-- Waits up to **300 seconds** for the deployment to stabilize
-- On failure: fetches the **last 30 lines of pod logs** for debugging
-- Automatically **rolls back** to the previous working revision
-- Keeps **3 revision history** entries for manual rollbacks
-
-### Deploy Lock
-
-A file-based lock (`/tmp/idlistack-<project>.lock`) prevents concurrent deployments of the same project using `flock`.
-
----
-
-## Configuration — `idlistack.toml`
+IdliStack is zero-config by default, but supports optional overrides:
 
 ```toml
-# IdliStack Configuration
-
 [project]
-name = "my-app"
+name = "my-service"
 
 [build]
-provider = ""              # auto-detected if empty (node, python, go, etc.)
-runtime = ""               # auto-detected if empty (22, 3.12, 1.26, etc.)
-pre_install_cmd = ""       # system deps (apt-get install ...)
-build_cmd = ""             # override detected build command
-start_cmd = ""             # override detected start command
+provider = "node"
+runtime = "22"
+install_cmd = "pnpm install"
+build_cmd = "pnpm build"
+start_cmd = "pnpm start"
 
 [deploy]
-port = 0                   # auto-detected if empty
-replicas = 1               # number of pod replicas
+port = 3000
+replicas = 2
 health_check_path = "/health"
+dependencies = ["postgres", "redis"]
 
 [env]
-DATABASE_URL = "postgres://..."
-SECRET_KEY = "your-secret"
-```
-
-All `[build]` and `[deploy]` values are **optional** — detection fills in sensible defaults. Any value you set **overrides** the detected value.
-
----
-
-## CLI Commands
-
-### `idlistack init`
-
-Initialize a new project in the current directory.
-
-```bash
-idlistack init              # Uses directory name as project name
-idlistack init -n my-app    # Custom project name
-```
-
-**Creates:**
-- `idlistack.toml` — Project configuration
-- `.idlistack/` — Internal state directory (gitignored)
-- `.idlistack/link.json` — Project metadata
-
----
-
-### `idlistack up`
-
-Run the full detect → build → deploy pipeline.
-
-```bash
-idlistack up                # Full pipeline
-idlistack up --inspect      # Preview the build plan only (no build/deploy)
-idlistack up -v             # Verbose output with debug info
-```
-
-**Flags:**
-| Flag | Description |
-|------|-------------|
-| `--inspect` | Preview the build plan without building or deploying |
-| `--detach`, `-d` | Run deployment in the background |
-| `--verbose`, `-v` | Enable debug output |
-
----
-
-### `idlistack down`
-
-Tear down the deployment and delete all Kubernetes resources.
-
-```bash
-idlistack down              # Interactive confirmation
-idlistack down -f           # Force (skip confirmation)
-```
-
-**Deletes:** Namespace, Deployments, Services, Ingresses, Secrets, ConfigMaps.
-**Keeps:** Built images in Minikube.
-
----
-
-### `idlistack status`
-
-Show the current deployment status.
-
-```bash
-idlistack status
-```
-
-**Displays:**
-- Project name and namespace
-- Deployment status (Running / Deploying / Down) with replica count
-- Service URL (via `minikube service --url`)
-- Pod listing with status
-
----
-
-### `idlistack logs`
-
-Stream live logs from the deployed application.
-
-```bash
-idlistack logs              # Stream logs (follow mode)
-idlistack logs -f=false     # Print logs without following
-idlistack logs -t 50        # Show last 50 lines
-```
-
-**Flags:**
-| Flag | Default | Description |
-|------|---------|-------------|
-| `--follow`, `-f` | `true` | Follow/stream log output |
-| `--tail`, `-t` | `100` | Number of recent log lines to show |
-
----
-
-### `idlistack env`
-
-Manage environment variables (stored as Kubernetes Secrets).
-
-```bash
-idlistack env set KEY=VALUE          # Set a variable
-idlistack env set A=1 B=2 C=3       # Set multiple at once
-idlistack env list                   # List all variables
-idlistack env delete KEY             # Delete a variable
-```
-
-Environment variables are injected into pods via `envFrom` → `secretRef`. Run `idlistack up` after changing env vars to apply.
-
----
-
-### `idlistack version`
-
-Print the CLI version.
-
-```bash
-idlistack version
+NODE_ENV = "production"
 ```
 
 ---
 
-## Project Structure
+## CLI Command Reference
 
-```
-idlistack/
-├── main.go                          # Entry point
-├── go.mod                           # Go module (github.com/idlistack/cli)
-├── Makefile                         # Build targets
-├── cmd/
-│   ├── root.go                      # Root command, global flags
-│   ├── init.go                      # idlistack init
-│   ├── up.go                        # idlistack up (pipeline, build, Dockerfile gen)
-│   ├── down.go                      # idlistack down
-│   ├── logs.go                      # idlistack logs
-│   ├── status.go                    # idlistack status
-│   └── env.go                       # idlistack env set/list/delete
-├── internal/
-│   ├── config/
-│   │   └── config.go                # TOML config parser
-│   ├── detect/
-│   │   └── detect.go                # Detection engine (languages, frameworks, versions)
-│   ├── buildplan/
-│   │   └── plan.go                  # Build plan struct & defaults
-│   ├── k8s/
-│   │   └── deployer.go              # Kubernetes deployer (manifests, rollouts, probes)
-│   └── ui/
-│       └── ui.go                    # Terminal UI (colors, banners, steps)
-└── bin/
-    └── idlistack                    # Compiled binary
-```
+| Command | Flags | Description |
+| :--- | :--- | :--- |
+| `idlistack init` | `-n, --name` | Initialize project and generate `idlistack.toml` |
+| `idlistack up` | `--inspect`, `-d, --detach` | Detect, build, sideload, and deploy to Kubernetes |
+| `idlistack status` | `-c, --cli`, `--no-browser`, `-p, --port` | Show cluster status and launch web console |
+| `idlistack logs` | `-f, --follow`, `-t, --tail` | Stream live container logs from Kubernetes |
+| `idlistack env set` | `KEY=VALUE...` | Set Kubernetes Secrets for the application |
+| `idlistack env list` | — | List and decode active environment secrets |
+| `idlistack down` | `-f, --force` | Uninstall Helm release and delete namespace |
+| `idlistack version`| — | Print IdliStack CLI version |
 
 ---
+## Local steps to setup
 
-## Build & Install
+# 1. One-Line Setup (Remote or from GitHub)
+curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
 
-```bash
-# Build
-make build
-
-# Install to ~/.local/bin
-make install
-
-# Development build & run
-make dev ARGS="up --inspect"
-
-# Run tests
-make test
-
-# Clean
-make clean
-```
-
-### Prerequisites
-
-| Tool | Required For |
-|------|-------------|
-| **Go 1.22+** | Building the CLI |
-| **Docker** | Building OCI images |
-| **Minikube** | Local Kubernetes cluster |
-| **kubectl** | Kubernetes resource management |
+# 2. Local Setup (From Cloned Repo)
+chmod +x ./install.sh
+./install.sh
 
 ---
-
 ## License
 
-Built by **T4GC**.
+MIT License &bull; Copyright (c) 2026 T4GC / IdliStack Team

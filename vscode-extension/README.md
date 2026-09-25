@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.4.0-blue.svg?style=flat-square" alt="Version 1.4.0" />
+  <img src="https://img.shields.io/badge/version-1.7.0-blue.svg?style=flat-square" alt="Version 1.7.0" />
   <img src="https://img.shields.io/badge/vscode-%3E%3D1.80.0-brightgreen.svg?style=flat-square" alt="VS Code 1.80+" />
   <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square" alt="License MIT" />
   <img src="https://img.shields.io/badge/kubernetes-K3s%20%7C%20Minikube-orange.svg?style=flat-square" alt="Kubernetes" />
@@ -98,12 +98,21 @@ NODE_ENV = "production"
 
 ---
 
-## System Requirements
+## System Requirements & One-Line Setup
 
+You can install all prerequisites (**Docker**, **K3s**, **Kubectl**, **Helm v3**, and permissions) automatically with our production-ready installer:
+
+```bash
+# One-line automated setup (Ubuntu, Debian, Fedora, RHEL, and Windows WSL2):
+curl -fsSL https://raw.githubusercontent.com/saintlionelpraveen/Idlistack-CLI/main/install.sh | bash
+```
+
+Manual requirements:
 - **Visual Studio Code**: Version `1.80.0` or higher
 - **Local Kubernetes Cluster**: K3s (recommended), Minikube, Kind, or Docker Desktop Kubernetes
-- **Container Engine**: Docker or Containerd
+- **Container Engine**: Docker Engine with non-root user access
 - **Helm**: Helm v3 CLI installed on system path
+- **Kubectl**: Configured to access your local cluster
 
 ---
 
