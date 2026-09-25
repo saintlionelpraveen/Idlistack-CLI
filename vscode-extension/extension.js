@@ -15,17 +15,40 @@ function resolveCliPath(extensionPath) {
     const isWin = os.platform() === 'win32';
     const binName = isWin ? 'idlistack.exe' : 'idlistack';
 
-    // 1. Check if idlistack is available on host system PATH
+    // 1. Check /usr/local/bin/idlistack directly first (from install.sh)
+    if (!isWin) {
+        const usrLocalBin = path.join('/usr', 'local', 'bin', binName);
+        if (fs.existsSync(usrLocalBin)) {
+            return usrLocalBin;
+        }
+    }
+
+    // 2. Check ~/.local/bin/idlistack directly
+    const userLocalBin = path.join(os.homedir(), '.local', 'bin', binName);
+    if (fs.existsSync(userLocalBin)) {
+        return userLocalBin;
+    }
+
+    // 3. Check if idlistack is available on host system PATH
     try {
         const checkCmd = isWin ? `where ${binName}` : `which ${binName}`;
         const stdout = cp.execSync(checkCmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
-        if (stdout && fs.existsSync(stdout.split('\n')[0].trim())) {
-            return stdout.split('\n')[0].trim();
+        if (stdout) {
+            const firstLine = stdout.split('\n')[0].trim();
+            if (fs.existsSync(firstLine)) {
+                return firstLine;
+            }
         }
     } catch (_) {}
 
-    // 2. Fall back to extension bundled binary
-    return path.join(extensionPath, 'bin', binName);
+    // 4. Bundled extension binary
+    const bundledBin = path.join(extensionPath, 'bin', binName);
+    if (fs.existsSync(bundledBin) && !isWin) {
+        try {
+            fs.chmodSync(bundledBin, 0o755);
+        } catch (_) {}
+    }
+    return bundledBin;
 }
 
 /**
@@ -35,27 +58,28 @@ function activate(context) {
     console.log('IdliStack extension v1.8.0 active!');
 
     const binDir = path.join(context.extensionPath, 'bin');
-    const cliPath = resolveCliPath(context.extensionPath);
     const isWin = os.platform() === 'win32';
+    const usrLocalBin = '/usr/local/bin';
+    const userLocalBin = path.join(os.homedir(), '.local', 'bin');
 
     // 1. Ensure bundled CLI binary is executable
     try {
-        if (fs.existsSync(cliPath) && !isWin) {
-            fs.chmodSync(cliPath, 0o755);
+        const bundledCli = path.join(binDir, isWin ? 'idlistack.exe' : 'idlistack');
+        if (fs.existsSync(bundledCli) && !isWin) {
+            fs.chmodSync(bundledCli, 0o755);
         }
     } catch (e) {
         console.error('Failed to set execute permissions on CLI binary:', e);
     }
 
     // 2. Global Terminal PATH Injection:
-    // Injects the extension bin directory into every integrated terminal opened in VS Code!
+    // Injects both system bin paths and the extension bin directory into every integrated terminal!
     if (context.environmentVariableCollection) {
-        context.environmentVariableCollection.prepend('PATH', `${binDir}${path.delimiter}`);
-        context.environmentVariableCollection.description = 'IdliStack CLI binary path';
+        context.environmentVariableCollection.prepend('PATH', `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}`);
+        context.environmentVariableCollection.description = 'IdliStack CLI binary paths';
     }
 
     // 3. User Environment Registration (~/.local/bin/idlistack & shell rc persistence):
-    // Allows running `idlistack` from any terminal session outside VS Code as well.
     try {
         const homeDir = os.homedir();
         const localBin = path.join(homeDir, '.local', 'bin');
@@ -63,11 +87,11 @@ function activate(context) {
             fs.mkdirSync(localBin, { recursive: true });
         }
         const symlinkPath = path.join(localBin, isWin ? 'idlistack.exe' : 'idlistack');
+        const cliPath = resolveCliPath(context.extensionPath);
         if (!fs.existsSync(symlinkPath) && fs.existsSync(cliPath)) {
             try {
                 fs.symlinkSync(cliPath, symlinkPath);
             } catch (_) {
-                // If symlink fails, copy binary
                 fs.copyFileSync(cliPath, symlinkPath);
                 if (!isWin) {
                     fs.chmodSync(symlinkPath, 0o755);
@@ -77,7 +101,7 @@ function activate(context) {
 
         // Ensure ~/.local/bin is present in ~/.bashrc and ~/.zshrc if not already there
         if (!isWin) {
-            const exportLine = '\n# IdliStack CLI path\nexport PATH="$HOME/.local/bin:$PATH"\n';
+            const exportLine = '\n# IdliStack CLI path\nexport PATH="$HOME/.local/bin:/usr/local/bin:$PATH"\n';
             for (const rcName of ['.bashrc', '.zshrc']) {
                 const rcPath = path.join(homeDir, rcName);
                 if (fs.existsSync(rcPath)) {
@@ -103,30 +127,33 @@ function activate(context) {
 
     // Helper to get or create a dedicated terminal with explicit PATH environment
     function getTerminal(name = 'IdliStack') {
+        const customPath = `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}${process.env.PATH || ''}`;
         let terminal = vscode.window.terminals.find(t => t.name === name);
         if (!terminal) {
             terminal = vscode.window.createTerminal({
                 name: name,
+                cwd: getWorkspaceRoot() || undefined,
                 env: {
-                    PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`
+                    PATH: customPath
                 }
             });
         }
-        terminal.show();
+        terminal.show(true);
         return terminal;
     }
 
     // Command: idlistack.terminal (Opens dedicated terminal with idlistack pre-configured)
     let terminalDisposable = vscode.commands.registerCommand("idlistack.terminal", function () {
         const rootPath = getWorkspaceRoot();
+        const customPath = `${usrLocalBin}${path.delimiter}${userLocalBin}${path.delimiter}${binDir}${path.delimiter}${process.env.PATH || ''}`;
         const terminal = vscode.window.createTerminal({
             name: 'IdliStack Terminal',
             cwd: rootPath || undefined,
             env: {
-                PATH: `${binDir}${path.delimiter}${process.env.PATH || ''}`
+                PATH: customPath
             }
         });
-        terminal.show();
+        terminal.show(true);
         terminal.sendText('echo "🚀 IdliStack Terminal ready! You can now run \\"idlistack init\\", \\"idlistack up\\", \\"idlistack status\\", etc."');
     });
 
@@ -134,18 +161,20 @@ function activate(context) {
     let initDisposable = vscode.commands.registerCommand("idlistack.init", function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
-        terminal.sendText(`"${cliPath}" init`);
+        terminal.sendText(`"${cli}" init`);
     });
 
     // Command: idlistack.inspect (Inspect stack, version, framework & plan preview)
     let inspectDisposable = vscode.commands.registerCommand("idlistack.inspect", function () {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
-        terminal.sendText(`"${cliPath}" up --inspect`);
+        terminal.sendText(`"${cli}" up --inspect`);
         vscode.window.showInformationMessage('IdliStack: Inspecting stack, runtime version, and framework...');
     });
 
@@ -154,14 +183,15 @@ function activate(context) {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
 
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
         
         const configPath = path.join(rootPath, 'idlistack.toml');
         if (!fs.existsSync(configPath)) {
-            terminal.sendText(`"${cliPath}" init && "${cliPath}" up`);
+            terminal.sendText(`"${cli}" init && "${cli}" up`);
         } else {
-            terminal.sendText(`"${cliPath}" up`);
+            terminal.sendText(`"${cli}" up`);
         }
         vscode.window.showInformationMessage('IdliStack: Building OCI image & deploying to K3s...');
     });
@@ -171,9 +201,10 @@ function activate(context) {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
 
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
-        terminal.sendText(`"${cliPath}" down`);
+        terminal.sendText(`"${cli}" down`);
     });
 
     // Command: idlistack.status
@@ -181,9 +212,10 @@ function activate(context) {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
 
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
-        terminal.sendText(`"${cliPath}" status`);
+        terminal.sendText(`"${cli}" status`);
     });
 
     // Command: idlistack.logs
@@ -191,9 +223,10 @@ function activate(context) {
         const rootPath = getWorkspaceRoot();
         if (!rootPath) return;
 
+        const cli = resolveCliPath(context.extensionPath);
         const terminal = getTerminal();
         terminal.sendText(`cd "${rootPath}"`);
-        terminal.sendText(`"${cliPath}" logs`);
+        terminal.sendText(`"${cli}" logs`);
     });
 
     // Status bar quick pick menu
