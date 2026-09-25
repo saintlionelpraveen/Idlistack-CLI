@@ -5,7 +5,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-1.7.0-blue.svg?style=flat-square" alt="Version 1.7.0" />
+  <img src="https://img.shields.io/badge/version-1.8.0-blue.svg?style=flat-square" alt="Version 1.8.0" />
   <img src="https://img.shields.io/badge/vscode-%3E%3D1.80.0-brightgreen.svg?style=flat-square" alt="VS Code 1.80+" />
   <img src="https://img.shields.io/badge/license-MIT-lightgrey.svg?style=flat-square" alt="License MIT" />
   <img src="https://img.shields.io/badge/kubernetes-K3s%20%7C%20Minikube-orange.svg?style=flat-square" alt="Kubernetes" />
@@ -50,6 +50,7 @@ Access these commands from the Command Palette (`Ctrl+Shift+P` / `Cmd+Shift+P`),
 
 | Command | Title | Description |
 | :--- | :--- | :--- |
+| `idlistack.terminal` | **IdliStack: Open Terminal** | Opens a dedicated terminal with `idlistack` in PATH |
 | `idlistack.init` | **IdliStack: Initialize Project** | Generates an `idlistack.toml` configuration template |
 | `idlistack.inspect` | **IdliStack: Inspect Stack & Plan** | Previews the detection engine, runtime version, and build plan |
 | `idlistack.up` | **IdliStack: Deploy to K3s (Up)** | Detects, builds OCI image, provisions databases, and deploys via Helm |
