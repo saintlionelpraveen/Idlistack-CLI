@@ -11,11 +11,8 @@ import (
 	"strings"
 
 	"github.com/fatih/color"
-	"github.com/idlistack/cli/internal/app"
 	"github.com/idlistack/cli/internal/buildplan"
 	"github.com/idlistack/cli/internal/config"
-	"github.com/idlistack/cli/internal/provider"
-	"github.com/idlistack/cli/internal/providers/registry"
 	"github.com/idlistack/cli/internal/ui"
 	"github.com/mattn/go-isatty"
 	"gopkg.in/yaml.v3"
@@ -61,8 +58,8 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 	// ─── Layer 0.5: Dynamic Rules Detection ─────────────────────────
 	layer05Plan, err05 := detectWithRules(projectDir, cfg, verbose)
 
-	// ─── Layer 1: Native Provider Detection (primary engine) ────────
-	layer1Plan, providerName, err1 := detectWithProviders(projectDir, cfg, verbose)
+	// ─── Layer 1: Railpack Detection (Railway primary builder) ─────
+	layerRailpackPlan, errRp := DetectWithRailpack(ctx, projectDir, cfg, verbose)
 
 	// If Layer 0.5 found something and there's also a Dockerfile, prompt the user
 	if layer0Plan != nil && layer05Plan != nil && (cfg == nil || cfg.Build.Provider == "") {
@@ -84,30 +81,6 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 			if choice == "2" {
 				applyConfigOverrides(layer05Plan, cfg)
 				return layer05Plan, nil
-			}
-		}
-	}
-
-	// If Layer 1 found something and there's also a Dockerfile, prompt the user
-	if layer0Plan != nil && layer1Plan != nil && layer05Plan == nil && (cfg == nil || cfg.Build.Provider == "") {
-		if IsInteractiveTerminal() {
-			fmt.Println()
-			ui.Info(fmt.Sprintf("Existing container setup found: %s", color.CyanString(layer0Plan.DockerfilePath)))
-			ui.Info(fmt.Sprintf("Detected framework signature:  %s (%s)", color.CyanString(layer1Plan.DetectedFramework), color.CyanString(layer1Plan.Provider)))
-			fmt.Println()
-			fmt.Println("  Choose build method:")
-			fmt.Printf("    [1] Use existing Dockerfile (%s)\n", layer0Plan.DockerfilePath)
-			fmt.Printf("    [2] Use IdliStack Zero-Config Buildpack (%s / %s)\n", layer1Plan.DetectedFramework, layer1Plan.Provider)
-			fmt.Println()
-			fmt.Print("  Select option [1/2] (default 1): ")
-
-			var choice string
-			fmt.Scanln(&choice)
-			choice = strings.TrimSpace(choice)
-
-			if choice == "2" {
-				applyConfigOverrides(layer1Plan, cfg)
-				return layer1Plan, nil
 			}
 		}
 	}
@@ -135,10 +108,10 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 
 	// Configured Provider wins over everything else
 	if cfg != nil && cfg.Build.Provider != "" {
-		if layer1Plan != nil && err1 == nil && layer1Plan.Provider == cfg.Build.Provider {
-			applyConfigOverrides(layer1Plan, cfg)
-			layer1Plan.Normalize()
-			return layer1Plan, nil
+		if layerRailpackPlan != nil && errRp == nil && layerRailpackPlan.Provider == cfg.Build.Provider {
+			applyConfigOverrides(layerRailpackPlan, cfg)
+			layerRailpackPlan.Normalize()
+			return layerRailpackPlan, nil
 		}
 		if layer05Plan != nil && err05 == nil && layer05Plan.Provider == cfg.Build.Provider {
 			applyConfigOverrides(layer05Plan, cfg)
@@ -157,33 +130,19 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 		return layer05Plan, nil
 	}
 
-	// Layer 1: Native provider detection (our primary engine)
-	if layer1Plan != nil && err1 == nil {
-		if verbose {
-			ui.Detail("Detected by provider: %s", color.CyanString(providerName))
-		}
-		applyConfigOverrides(layer1Plan, cfg)
-		layer1Plan.Normalize()
-		return layer1Plan, nil
-	}
-
-	// ─── Layer 2: Railpack detection (Railway primary builder) ────────
-	if verbose {
-		ui.Detail("Trying Railpack detection...")
-	}
-	layerRailpackPlan, errRp := detectWithRailpack(ctx, projectDir, cfg, verbose)
+	// Layer 1: Railpack Detection (Primary)
 	if layerRailpackPlan != nil && errRp == nil {
 		if verbose {
-			ui.Detail("Detected by Railpack: %s", color.CyanString(layerRailpackPlan.Stack))
+			ui.Detail("Detected by Railpack: %s (%s)", color.CyanString(layerRailpackPlan.Stack), color.HiBlackString(layerRailpackPlan.Runtime))
 		}
 		applyConfigOverrides(layerRailpackPlan, cfg)
 		layerRailpackPlan.Normalize()
 		return layerRailpackPlan, nil
 	}
 
-	// ─── Layer 2.5: Nixpacks fallback ─────────────────────────────────
+	// ─── Layer 2: Nixpacks fallback ─────────────────────────────────
 	if verbose {
-		ui.Detail("No native provider matched, trying Nixpacks fallback...")
+		ui.Detail("No Railpack plan matched, trying Nixpacks fallback...")
 	}
 	layer2Plan, err2 := detectWithNixpacks(ctx, projectDir, cfg, verbose)
 	if layer2Plan != nil && err2 == nil {
@@ -205,79 +164,6 @@ func Detect(ctx context.Context, projectDir string, cfg *config.Config, verbose 
 
 func IsInteractiveTerminal() bool {
 	return isatty.IsTerminal(os.Stdin.Fd()) || isatty.IsCygwinTerminal(os.Stdin.Fd())
-}
-
-// ─── Layer 1: Native Provider Detection (Railpack-style) ────────────────
-
-// detectWithProviders scans the project using all registered providers.
-// Returns the plan from the first matching provider, plus the provider name.
-func detectWithProviders(projectDir string, cfg *config.Config, verbose bool) (*buildplan.Plan, string, error) {
-	// Build the file-system index
-	projectApp, err := app.NewApp(projectDir)
-	if err != nil {
-		return nil, "", fmt.Errorf("failed to scan project directory: %w", err)
-	}
-
-	detectCtx := &provider.DetectContext{
-		App:        projectApp,
-		Config:     cfg,
-		ProjectDir: projectDir,
-		Verbose:    verbose,
-	}
-
-	// If user has specified a provider in idlistack.toml, use that directly
-	if cfg != nil && cfg.Build.Provider != "" {
-		if p := registry.GetProvider(cfg.Build.Provider); p != nil {
-			if err := p.Initialize(detectCtx); err == nil {
-				if plan, err := p.Plan(detectCtx); err == nil {
-					plan.DetectionSource = fmt.Sprintf("provider-%s-config", p.Name())
-					plan.DetectionConfidence = "high"
-					return plan, p.Name(), nil
-				}
-			}
-		}
-	}
-
-	// Run all providers in order — first match wins
-	for _, p := range registry.GetProviders() {
-		matched, err := p.Detect(detectCtx)
-		if err != nil {
-			if verbose {
-				fmt.Printf("  [debug] Provider %s detect error: %v\n", p.Name(), err)
-			}
-			continue
-		}
-
-		if !matched {
-			continue
-		}
-
-		if verbose {
-			fmt.Printf("  [debug] Provider %s matched, initializing...\n", p.Name())
-		}
-
-		if err := p.Initialize(detectCtx); err != nil {
-			if verbose {
-				fmt.Printf("  [debug] Provider %s init failed: %v\n", p.Name(), err)
-			}
-			continue
-		}
-
-		plan, err := p.Plan(detectCtx)
-		if err != nil {
-			if verbose {
-				fmt.Printf("  [debug] Provider %s plan failed: %v\n", p.Name(), err)
-			}
-			continue
-		}
-
-		plan.DetectionSource = fmt.Sprintf("provider-%s", p.Name())
-		plan.DetectionConfidence = "high"
-
-		return plan, p.Name(), nil
-	}
-
-	return nil, "", fmt.Errorf("no provider matched the project structure")
 }
 
 // ─── Layer 0: Dockerfile & Docker-Compose Detection ─────────────────────
@@ -650,102 +536,3 @@ func parseNixpacksPlan(data []byte, projectDir string, verbose bool) (*buildplan
 	return plan, nil
 }
 
-// ─── Layer 2: Railpack Detection ────────────────────────────────────────
-
-func detectWithRailpack(ctx context.Context, projectDir string, cfg *config.Config, verbose bool) (*buildplan.Plan, error) {
-	bin, err := exec.LookPath("railpack")
-	if err != nil {
-		return nil, err
-	}
-
-	cmd := exec.CommandContext(ctx, bin, "plan", projectDir)
-	output, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("railpack plan failed: %w", err)
-	}
-
-	return parseRailpackPlan(output, projectDir, verbose)
-}
-
-func parseRailpackPlan(data []byte, projectDir string, verbose bool) (*buildplan.Plan, error) {
-	var rpPlan struct {
-		Deploy struct {
-			StartCommand string            `json:"startCommand"`
-			Variables    map[string]string `json:"variables"`
-		} `json:"deploy"`
-		Steps []struct {
-			Name     string            `json:"name"`
-			Assets   map[string]string `json:"assets"`
-			Commands []struct {
-				Cmd string `json:"cmd"`
-			} `json:"commands"`
-		} `json:"steps"`
-	}
-
-	if err := json.Unmarshal(data, &rpPlan); err != nil {
-		return nil, fmt.Errorf("failed to parse railpack plan: %w", err)
-	}
-
-	plan := buildplan.NewDefaultPlan()
-	plan.DetectionSource = "layer2-railpack"
-	plan.DetectionConfidence = "high"
-	plan.StartCmd = rpPlan.Deploy.StartCommand
-
-	for _, step := range rpPlan.Steps {
-		if step.Assets != nil {
-			if miseToml, ok := step.Assets["generated-mise-toml"]; ok {
-				for _, lang := range []string{"python", "node", "go", "rust", "ruby", "php", "java", "elixir", "deno", "bun", "dotnet"} {
-					re := regexp.MustCompile(fmt.Sprintf(`(?m)^\s*%s\s*=\s*"([^"]+)"`, regexp.QuoteMeta(lang)))
-					if m := re.FindStringSubmatch(miseToml); len(m) > 1 {
-						plan.Provider = lang
-						plan.Runtime = m[1]
-						plan.StackVersion = m[1]
-						plan.DetectedFramework = lang
-						break
-					}
-				}
-			}
-		}
-		if step.Name == "install" && len(step.Commands) > 0 {
-			for _, c := range step.Commands {
-				if c.Cmd != "" {
-					plan.InstallCmd = c.Cmd
-					break
-				}
-			}
-		}
-		if step.Name == "build" && len(step.Commands) > 0 {
-			for _, c := range step.Commands {
-				if c.Cmd != "" {
-					plan.BuildCmd = c.Cmd
-					break
-				}
-			}
-		}
-	}
-
-	if plan.Port == 0 {
-		plan.Port = detectConfigPort(projectDir)
-		if plan.Port == 0 {
-			switch plan.Provider {
-			case "node":
-				plan.Port = 3000
-			case "python":
-				plan.Port = 8000
-			case "go":
-				plan.Port = 8080
-			case "rust":
-				plan.Port = 8080
-			default:
-				plan.Port = 8080
-			}
-		}
-	}
-
-	if plan.Provider == "" && plan.StartCmd == "" {
-		return nil, fmt.Errorf("railpack returned empty plan")
-	}
-
-	plan.Normalize()
-	return plan, nil
-}

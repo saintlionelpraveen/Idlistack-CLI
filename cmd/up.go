@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -171,6 +172,10 @@ func runUp(cmd *cobra.Command, args []string) error {
 	// ─── Step 4: Build OCI Image ────────────────────────────────────
 	ui.Step(4, 6, "Building OCI image")
 
+	if plan.Provider == "php" {
+		ensurePHPExtensions(cwd)
+	}
+
 	imageTag := fmt.Sprintf("idlistack/%s:%s", strings.ToLower(cfg.Project.Name), generateDeployHash())
 
 	if plan.ComposeImage != "" {
@@ -187,29 +192,31 @@ func runUp(cmd *cobra.Command, args []string) error {
 		if err := buildWithDockerfile(ctx, cwd, plan.DockerfilePath, imageTag); err != nil {
 			return fmt.Errorf("docker build failed: %w", err)
 		}
-	} else if strings.HasPrefix(plan.DetectionSource, "provider-") {
-		// Provider-detected plan: try Railpack first for optimal BuildKit builds,
-		// fall back to generating a Dockerfile from the build plan
-		if _, err := exec.LookPath("railpack"); err == nil {
-			ui.Detail("Building OCI image using Railpack (BuildKit)")
-			rpCmd := exec.CommandContext(ctx, "railpack", "build", cwd, "--name", imageTag)
-			rpCmd.Stdout = os.Stdout
-			rpCmd.Stderr = os.Stderr
-			if err := rpCmd.Run(); err != nil {
-				ui.Detail("Railpack build failed, falling back to generated Dockerfile")
-				if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
-					return fmt.Errorf("build failed: %w", err)
-				}
-			}
-		} else {
-			ui.Detail("Generating Dockerfile from build plan (provider: %s)", color.CyanString(plan.Provider))
+	} else if rpBin, err := detect.ResolveRailpackBinary(); err == nil {
+		// Use Railpack for BuildKit builds (auto-downloaded or from PATH)
+		ui.Detail("Building OCI image using Railpack (BuildKit)")
+
+		buildkitHost, bkErr := ensureBuildKitDaemon(ctx)
+		if bkErr != nil {
+			ui.Detail("Notice: BuildKit daemon check: %v (falling back if needed)", bkErr)
+		}
+
+		rpCmd := exec.CommandContext(ctx, rpBin, "build", cwd, "--name", imageTag)
+		rpCmd.Env = os.Environ()
+		if buildkitHost != "" {
+			rpCmd.Env = append(rpCmd.Env, "BUILDKIT_HOST="+buildkitHost)
+		}
+		rpCmd.Stdout = os.Stdout
+		rpCmd.Stderr = os.Stderr
+		if err := rpCmd.Run(); err != nil {
+			ui.Detail("Railpack build failed, falling back to generated Dockerfile: %v", err)
 			if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
 				return fmt.Errorf("build failed: %w", err)
 			}
 		}
 	} else {
-		// Nixpacks/AI-detected plan: generate Dockerfile from build plan
-		ui.Detail("Generating Dockerfile from build plan")
+		// Native fallback: generate Dockerfile from build plan
+		ui.Detail("Generating Dockerfile from build plan (provider: %s)", color.CyanString(plan.Provider))
 		if err := buildWithGeneratedDockerfile(ctx, cwd, imageTag, plan); err != nil {
 			return fmt.Errorf("build failed: %w", err)
 		}
@@ -488,9 +495,9 @@ func buildWithGeneratedDockerfile(ctx context.Context, projectDir, imageTag stri
 	}
 
 	// Add Start Command / Entrypoint
-	if plan.Provider == "php" && (plan.StartCmd == "/entrypoint.sh" || plan.StartCmd == "") {
-		df.WriteString("ENTRYPOINT [\"/entrypoint.sh\"]\n")
-	} else if plan.StartCmd != "" && !isPlaceholderCmd(plan.StartCmd) {
+	if plan.Provider == "php" && (plan.StartCmd == "/entrypoint.sh" || plan.StartCmd == "" || plan.StartCmd == "/start-container.sh") {
+		// Apache handles startup natively (apache2-foreground)
+	} else if plan.StartCmd != "" && !isPlaceholderCmd(plan.StartCmd) && !strings.Contains(plan.StartCmd, "start-container.sh") {
 		// Split start command for CMD array
 		parts := strings.Fields(plan.StartCmd)
 		cmdJSON, _ := json.Marshal(parts)
@@ -562,7 +569,12 @@ func resolveBaseImage(plan *buildplan.Plan) string {
 	case "php":
 		version := "8.2" // Modern stable production PHP
 		if plan.Runtime != "" && plan.Runtime != "8" && plan.Runtime != "latest" && plan.Runtime != "lts" {
-			version = plan.Runtime
+			re := regexp.MustCompile(`(\d+\.\d+)`)
+			if m := re.FindStringSubmatch(plan.Runtime); len(m) > 1 {
+				version = m[1]
+			} else {
+				version = plan.Runtime
+			}
 		} else if plan.Runtime == "8" {
 			version = "8.2"
 		}
@@ -824,4 +836,130 @@ func zipDirectory(source, target string, ignorePatterns []string) error {
 		return err
 	})
 }
+
+// ensureBuildKitDaemon checks if BUILDKIT_HOST is set; if not, checks if Docker is available
+// and ensures a local moby/buildkit container is running, returning its connection URL.
+func ensureBuildKitDaemon(ctx context.Context) (string, error) {
+	if host := os.Getenv("BUILDKIT_HOST"); host != "" {
+		return host, nil
+	}
+
+	if _, err := exec.LookPath("docker"); err != nil {
+		return "", fmt.Errorf("docker not installed")
+	}
+
+	const containerName = "idlistack-buildkit"
+
+	// 1. Check if container is already running
+	out, err := exec.CommandContext(ctx, "docker", "inspect", "-f", "{{.State.Running}}", containerName).Output()
+	if err == nil && strings.TrimSpace(string(out)) == "true" {
+		return "docker-container://" + containerName, nil
+	}
+
+	// 2. If container exists but is stopped, start it
+	if err == nil {
+		startCmd := exec.CommandContext(ctx, "docker", "start", containerName)
+		if startErr := startCmd.Run(); startErr == nil {
+			return "docker-container://" + containerName, nil
+		}
+	}
+
+	// 3. Otherwise, create and run the buildkit daemon
+	ui.Detail("Provisioning dynamic BuildKit daemon (%s)...", containerName)
+	runCmd := exec.CommandContext(ctx, "docker", "run", "-d",
+		"--name", containerName,
+		"--privileged",
+		"--restart", "unless-stopped",
+		"moby/buildkit:latest",
+	)
+	if runErr := runCmd.Run(); runErr != nil {
+		return "", fmt.Errorf("failed to start BuildKit daemon: %w", runErr)
+	}
+
+	return "docker-container://" + containerName, nil
+}
+
+// ensurePHPExtensions scans PHP source files when composer.json is absent
+// and generates a minimal composer.json requiring the detected PHP extensions
+// so Railpack automatically installs them during image build.
+func ensurePHPExtensions(projectDir string) {
+	composerPath := filepath.Join(projectDir, "composer.json")
+	if _, err := os.Stat(composerPath); err == nil {
+		return // Existing composer.json, do not modify
+	}
+
+	// Scan PHP files for common database and utility extensions
+	exts := make(map[string]bool)
+
+	_ = filepath.Walk(projectDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			if info != nil && info.IsDir() && (info.Name() == ".git" || info.Name() == ".idlistack") {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if !strings.HasSuffix(info.Name(), ".php") {
+			return nil
+		}
+
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			return nil
+		}
+		content := string(data)
+
+		if strings.Contains(content, "mysqli") {
+			exts["ext-mysqli"] = true
+		}
+		if strings.Contains(content, "pdo_mysql") || strings.Contains(content, "mysql:") {
+			exts["ext-pdo_mysql"] = true
+		}
+		if strings.Contains(content, "pdo_pgsql") || strings.Contains(content, "pgsql:") {
+			exts["ext-pdo_pgsql"] = true
+		}
+		if strings.Contains(content, "pdo_sqlite") || strings.Contains(content, "sqlite:") {
+			exts["ext-pdo_sqlite"] = true
+		}
+		if strings.Contains(content, "imagecreate") || strings.Contains(content, "imagepng") || strings.Contains(content, "imagejpeg") {
+			exts["ext-gd"] = true
+		}
+		if strings.Contains(content, "ZipArchive") {
+			exts["ext-zip"] = true
+		}
+		if strings.Contains(content, "curl_init") {
+			exts["ext-curl"] = true
+		}
+		if strings.Contains(content, "mb_") {
+			exts["ext-mbstring"] = true
+		}
+
+		return nil
+	})
+
+	if len(exts) == 0 {
+		return
+	}
+
+	reqMap := make(map[string]string)
+	var extNames []string
+	for ext := range exts {
+		reqMap[ext] = "*"
+		extNames = append(extNames, ext)
+	}
+
+	compObj := map[string]interface{}{
+		"name":        "idlistack/app",
+		"description": "Auto-generated by IdliStack for PHP extension discovery",
+		"require":     reqMap,
+	}
+
+	compBytes, err := json.MarshalIndent(compObj, "", "  ")
+	if err == nil {
+		if writeErr := os.WriteFile(composerPath, compBytes, 0644); writeErr == nil {
+			ui.Detail("Auto-detected PHP extensions: %s", color.CyanString(strings.Join(extNames, ", ")))
+		}
+	}
+}
+
+
 

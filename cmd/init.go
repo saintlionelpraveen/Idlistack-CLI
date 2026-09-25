@@ -27,10 +27,12 @@ necessary configuration for detection, building, and deployment.`,
 
 var (
 	initProjectName string
+	initForce       bool
 )
 
 func init() {
 	initCmd.Flags().StringVarP(&initProjectName, "name", "n", "", "Project name (defaults to directory name)")
+	initCmd.Flags().BoolVarP(&initForce, "force", "f", false, "Force re-initialization (overwrites existing idlistack.toml)")
 }
 
 func runInit(cmd *cobra.Command, args []string) error {
@@ -48,8 +50,8 @@ func runInit(cmd *cobra.Command, args []string) error {
 
 	// Check if already initialized
 	configPath := filepath.Join(cwd, "idlistack.toml")
-	if _, err := os.Stat(configPath); err == nil {
-		ui.Warn("Project already initialized (idlistack.toml exists)")
+	if _, err := os.Stat(configPath); err == nil && !initForce {
+		ui.Warn("Project already initialized (idlistack.toml exists). Use --force to re-initialize.")
 		return nil
 	}
 

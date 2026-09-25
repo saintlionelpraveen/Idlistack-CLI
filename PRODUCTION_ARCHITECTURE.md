@@ -1,158 +1,188 @@
 # IdliStack CLI — Production Architecture & Technical Reference
 
 > **Deploy any application with zero configuration.**
-> Designed for local environments and production edge clusters. Powered by Go, Docker, Helm, and K3s.
+> Designed for local environments and production edge clusters. Powered by Go, Railpack (BuildKit), Docker, Helm, and K3s.
 
 ---
 
 ## 1. Executive Summary & Design Philosophy
 
-IdliStack is a production-grade deployment orchestrator that abstracts the complexities of containerization and Kubernetes. It is designed to act as an invisible, intelligent pipeline that automatically **detects** an application's stack, **compiles** an optimized OCI-compliant image, and **deploys** it to a lightweight K3s cluster using native Helm charts.
+IdliStack is a production-grade deployment orchestrator that abstracts the complexities of containerization and Kubernetes. It acts as an intelligent, invisible pipeline that automatically **detects** an application's stack, **compiles** an optimized OCI-compliant image via **Railpack** (BuildKit), and **deploys** it to a lightweight **K3s** cluster using native **Helm** charts with persistent storage and companion database sidecars.
 
 ### Core Tenets
-- **Zero Configuration:** Developers should not need to write `Dockerfiles`, Kubernetes YAMLs, or CI/CD pipelines to achieve a production-ready local deployment.
-- **Dynamic Adaptability:** Hardcoded versions are anti-patterns. IdliStack dynamically infers runtimes from source code (e.g., `package.json`, `go.mod`, `.ruby-version`).
-- **Production-Grade Tooling:** Moving away from development-only tools (like Minikube and raw manifests), IdliStack utilizes **K3s** (a CNCF-certified Kubernetes distribution) and **Helm** (the industry-standard package manager) to ensure parity with real-world production environments.
+- **Zero Configuration:** Developers never need to write `Dockerfiles`, Kubernetes YAMLs, or CI/CD pipelines to achieve a production-ready deployment.
+- **Dynamic Adaptability:** Hardcoded versions are anti-patterns. IdliStack dynamically infers runtimes from source code (e.g., `package.json`, `go.mod`, `.python-version`, `Cargo.toml`).
+- **Production-Grade Tooling:** IdliStack utilizes **K3s** (a CNCF-certified lightweight Kubernetes distribution), **Railpack** (Railway's modern BuildKit compiler), and **Helm** (atomic releases, rollbacks, and lifecycle hooks) to ensure exact parity with real-world cloud environments.
+- **Zero-Install Client Resilience:** End users do not need to pre-install Railpack. IdliStack's standalone resolver automatically fetches the binary transparently into `~/.idlistack/bin/railpack`, with a built-in multi-stage Dockerfile generator as an offline safety net.
 
 ---
 
 ## 2. Technology Stack
 
 | Component | Technology | Role & Purpose |
-|-----------|-----------|---------|
-| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Handles command parsing, subcommands (`up`, `down`, `status`, `env`), flags, and contextual help text. |
-| **Configuration** | TOML | Parses the `idlistack.toml` file for project-specific overrides. |
-| **Detection Engine** | Native Go | Custom multi-layered engine to infer language, framework, runtime version, and start commands. |
-| **Image Builder** | Docker Engine & BuildKit | Compiles the inferred architecture into OCI-compliant images using multi-stage Dockerfiles. |
-| **Container Runtime** | K3s (containerd) | A highly efficient, single-binary Kubernetes distribution replacing Minikube for native execution. |
-| **Orchestrator** | Helm | Scaffolds and manages Kubernetes resources atomically (upgrades, rollbacks, hooks). |
+| :--- | :--- | :--- |
+| **CLI Framework** | [Cobra](https://github.com/spf13/cobra) (Go) | Command parsing, subcommands (`up`, `down`, `status`, `env`, `init`), flags, and contextual help. |
+| **Configuration** | TOML | Parses `idlistack.toml` for optional project-specific overrides. |
+| **Primary Build Engine** | [Railpack](https://railpack.com) (v0.39+) | Modern BuildKit-based planner & OCI image compiler by Railway. |
+| **Fallback Detection** | Nixpacks & Gemini AI | Secondary and tertiary fallback engines for rare or complex edge cases. |
+| **Image Builder** | Docker Engine & BuildKit | Compiles inferred architectures into OCI-compliant images with multi-tier caching. |
+| **Cluster Runtime** | K3s (containerd) | Lightweight, single-binary Kubernetes distribution with direct image sideloading. |
+| **Orchestrator** | Helm v3 | Scaffolds and manages Kubernetes resources atomically (deployments, rollbacks, hooks). |
+| **Management Console** | Embedded HTTP & SSE | Embedded Go web server providing real-time metrics, live log streaming, web shell, and backups. |
 
 ---
 
-## 3. The Deployment Pipeline Lifecycle
+## 3. The 6-Stage Deployment Pipeline
 
-The core of IdliStack is the `idlistack up` command, which executes a strict 6-stage lifecycle. 
+Every execution of `idlistack up` runs through a deterministic 6-stage lifecycle:
 
-### 3.1. Workspace Validation & Initialization
-Before any heavy lifting occurs, the CLI validates the integrity of the workspace.
-- **Config Parsing:** Reads `idlistack.toml` to identify manual overrides (e.g., explicitly defined ports or build commands).
-- **Size Boundary Checks:** Recursively calculates the size of the source directory. It respects `.idlistackignore` and `.gitignore` to prevent uploading massive artifacts (like `node_modules` or `.git`) to the Docker build context. It enforces a dynamic size limit (Current Size + 500MB buffer) to prevent system memory exhaustion.
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                              idlistack up                              │
+├────────────┬────────────┬────────────┬────────────┬────────────┬───────┤
+│  Stage 1   │  Stage 2   │  Stage 3   │  Stage 4   │  Stage 5   │Stage 6│
+│  Validate  │   Detect   │ Save Build │ Build OCI  │  Sideload  │ Helm  │
+│  Project   │ Application│   Plan     │ via Railpack│  to K3s   │Deploy │
+└────────────┴────────────┴────────────┴────────────┴────────────┴───────┘
+```
 
-### 3.2. Dynamic Detection Engine
-The detection engine is the "brain" of IdliStack. It scans the workspace to determine *what* the application is and *how* it should be run.
+### 3.1. Stage 1: Workspace Validation & Sizing
+- **Config Verification:** Loads `idlistack.toml`. If missing, prompts the user to initialize via `idlistack init` (or generates a preview config when run with `--inspect`).
+- **Ignore Engine:** Recursively scans the directory using `.idlistackignore` (and `.gitignore` as fallback). Excludes heavy artifacts (`node_modules`, `.git`, `__pycache__`, `.venv`, `target`, `dist`).
+- **Dynamic Size Ceiling:** Enforces `currentSize + 500MB` buffer to protect system resources.
 
-- **Layer 0 (Escape Hatch):** If a `Dockerfile` is present in the root directory, IdliStack bypasses native detection and uses the provided Dockerfile. It parses the `EXPOSE` directive to infer network ports.
-- **Layer 1 (Native Providers):** The built-in detector scans for **Signal Files**.
-  - **Node.js:** Looks for `package.json`, `next.config.js`, `.ghost-cli`. Infers Node version from engines or `.nvmrc`.
-  - **Python:** Looks for `requirements.txt`, `pyproject.toml`, `manage.py`.
-  - **Go:** Parses `go.mod` for the Go version.
-  - **Rust, Ruby, PHP, Java:** Matches specific lockfiles and manifests.
-- **Command Inference:** Based on the framework detected (e.g., Next.js vs Ghost CMS), it injects the exact `Install`, `Build`, and `Start` commands required.
+### 3.2. Stage 2: Multi-Layer Detection Engine
+The detection hierarchy identifies the stack, runtime version, and start commands:
 
-### 3.3. Build Plan Generation
-The outputs of the Detection layer are serialized into a strict JSON schema and saved to `.idlistack/buildplan.json`. 
-- **Purpose:** This file acts as the single source of truth. It allows developers to run `idlistack up --inspect` to preview the build strategy without triggering a deployment, ensuring transparency.
+```
+┌─────────────────────────────────────────────────────────────┐
+│ Layer 0: Existing Dockerfile & docker-compose.yml           │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 0.5: Dynamic Specialized Rules (Ghost, Frappe, etc.)  │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 1: Railpack Detection Engine (Primary v0.39+)         │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 2: Nixpacks Fallback                                  │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 3: Gemini AI Fallback (Last Resort)                   │
+└─────────────────────────────────────────────────────────────┘
+```
 
-### 3.4. OCI Image Compilation
-IdliStack transforms the Build Plan into a runnable container image.
-- **Base Image Resolution:** Selects an optimized, minimal base image based on the detected runtime (e.g., `node:22-bookworm`, `golang:1.26-alpine`). If no version is specified, it defaults to rolling aliases (like `lts` or `latest`) to prevent staleness.
-- **Multi-Stage Dockerfile Generation:** Scaffolds `.idlistack/Dockerfile.generated`.
-  - **Stage 1 (Builder):** Copies source code, runs pre-install scripts, package managers, and build binaries.
-  - **Stage 2 (Runtime):** Strips away build tools, sets user permissions, copies compiled artifacts from the builder, injects ENV variables, and defines the `CMD`.
-- **Execution:** Triggers `docker build` using BuildKit caching optimizations. The image is tagged dynamically: `idlistack/<project-name>:<unix-timestamp>`.
+- **Transparent Railpack Resolution:** Uses `ResolveRailpackBinary()`. If `railpack` is not in the system `PATH`, it checks `~/.idlistack/bin/railpack` or automatically downloads the standalone static binary for the host OS and architecture.
+- **Port Detection:** Inspects `.env`, `config.toml`, or defaults based on stack conventions (Node: 3000, Python: 8000, Go: 8080).
 
-### 3.5. Runtime Injection (Sideloading)
-To avoid the latency and configuration overhead of pushing images to an external Docker registry (like Docker Hub or AWS ECR), IdliStack injects the image directly into K3s.
-- **Process:** It exports the built image into a tarball (`docker save ... -o /tmp/img.tar`).
-- **Import:** It utilizes the K3s internal containerd runtime (`sudo k3s ctr images import`) to sideload the image. Kubernetes manifests use `imagePullPolicy: Never` to ensure it boots instantly from the local cache.
+### 3.3. Stage 3: Build Plan Serialization
+- Serializes the normalized build plan into `.idlistack/buildplan.json`.
+- When invoked as `idlistack up --inspect`, outputs formatted JSON and confidence ratings without triggering a build or deployment.
 
-### 3.6. Helm & Kubernetes Orchestration
-The final stage abstracts Kubernetes YAML templating and applies it natively.
-- **Scaffolding:** IdliStack creates a valid Helm chart structure inside `.idlistack/helm/`, generating `Chart.yaml` and writing dynamic deployment templates (Deployments, Services, PVCs) into the `templates/` directory.
-- **Atomic Upgrades:** Executes `helm upgrade --install <app> .idlistack/helm --namespace <ns> --create-namespace --wait --timeout 300s`. 
-- **Rollback Protection:** If the rollout fails (e.g., the application crashes on boot), the `--wait` flag catches the failure. IdliStack immediately fetches the last 30 lines of container logs for debugging and issues a `helm rollback` to revert the cluster to the last stable state.
+### 3.4. Stage 4: OCI Image Compilation
+- **Tag Generation:** Generates a deterministic tag: `idlistack/<project-name>:<unix-timestamp>`.
+- **Railpack Compilation:** Triggers `railpack build . --name <imageTag>` utilizing Docker BuildKit caching mounts.
+- **Native Fallback:** If Railpack is unavailable, generates an optimized multi-stage Dockerfile (`.idlistack/Dockerfile.generated`) and builds directly via `docker build`.
+
+### 3.5. Stage 5: Cluster Detection & Image Sideloading
+To bypass the latency, network cost, and credential management of public Docker registries, IdliStack injects images directly into the local cluster:
+- **Cluster Discovery:** Detects K3s, Minikube, Kind, or Docker Desktop via `kubectl config current-context` and node metadata.
+- **K3s containerd Import:** Exports the image to `/tmp/idlistack-<time>.tar` and imports via `k3s ctr images import`.
+- **Sidecar Pre-loading:** Pulls and sideloads dependency images (`postgres:15-alpine`, `mariadb:10.6`, `redis:7-alpine`, `busybox:1.36`).
+
+### 3.6. Stage 6: Helm Orchestration & Rollout
+- **Concurrency Locking:** Acquires `/tmp/idlistack-<app>.lock` via `syscall.Flock`.
+- **Chart Generation:** Writes dynamic manifests to `.idlistack/helm/templates/`.
+- **Zombie Release Purging:** Identifies and cleans releases stuck in `pending-install`, `pending-upgrade`, or `failed`.
+- **Atomic Deployment:** Runs:
+  ```bash
+  helm upgrade --install <app> .idlistack/helm --namespace idlistack-<app> --create-namespace --wait --timeout 300s --atomic
+  ```
+- **Crash Diagnostic & Rollback:** If the pod fails readiness probes, IdliStack dumps the last 30 lines of container logs and warning events before executing an atomic rollback.
 
 ---
 
 ## 4. Subsystems & Key Workflows
 
-### 4.1. Dependency Injection (Databases & Caches)
-IdliStack dynamically provisions backing services (MySQL, Postgres, Redis) if it detects their usage in environment variables or configuration files.
-- **Stateful Deployment:** Generates standard `Deployment` manifests with `PersistentVolumeClaims` (PVCs) attached to ensure database persistence across rollouts.
-- **Lifecycle Integration:** These dependencies are deployed alongside the application via Helm. The application pods use robust TCP Socket `startupProbes` and `livenessProbes` to gracefully handle the delay while the databases initialize.
+### 4.1. Automated Companion Dependencies (Databases & Caches)
+IdliStack automatically inspects environment variables and configuration files for database connection strings:
+- **PostgreSQL 15:** Injects `Deployment`, `Service`, and persistent 5Gi `PersistentVolumeClaim`.
+- **MariaDB 10.6 / MySQL:** Provisions service and automatically mounts any project `database.sql` into `/docker-entrypoint-initdb.d/init.sql` via a Kubernetes `ConfigMap`.
+- **Redis 7:** Provisions cache deployment and service.
 
-### 4.2. Traffic Routing & Networking
-- **Port Management:** The detection engine identifies the application's binding port (e.g., `3000` for Next.js, `8000` for Django).
-- **Service Exposure:** Creates a K8s `Service` of type `NodePort`. 
-- **Endpoint Resolution:** Dynamically fetches the K3s Internal IP via `kubectl get nodes -o jsonpath='{.items[0].status.addresses[?(@.type=="InternalIP")].address}'` and combines it with the NodePort to provide the user with a clickable, routable HTTP URL.
+### 4.2. Traffic Routing & Deterministic NodePorts
+- Queries cluster-wide allocated NodePorts to prevent port collisions.
+- Computes a deterministic port in `30000–32767` using FNV-1a hashing on the project name.
+- Resolves the host Node IP to present the user with a clickable, routable URL (`http://<node-ip>:<node-port>`).
 
-### 4.3. Pre-Deploy Migrations (Helm Hooks)
-If the application requires pre-deployment tasks (like database schema migrations), IdliStack generates a K8s `Job`.
-- **Helm Hook Annotations:** The Job is annotated with `"helm.sh/hook": pre-install,pre-upgrade`.
-- **Execution:** Helm halts the rollout of the main application containers until the Job completes successfully, guaranteeing data consistency.
+### 4.3. Robust Health Probes & File Permissions
+- Employs **TCP Socket Probes** (`startupProbe`, `livenessProbe`, `readinessProbe`) instead of fragile HTTP endpoints.
+- Allocates a **150-second startup window** (30 attempts × 5s) to allow slow frameworks or database migrations to complete before liveness probes kick in.
+- Injects a `busybox:1.36` `initContainer` to enforce volume ownership (`chmod -R 777` / `chown -R 1000:1000`) for non-root containers.
 
-### 4.4. Environment Variable & Secret Management
-Managed via the `idlistack env` command suite.
-- Variables are saved as Kubernetes `Opaque Secrets`.
-- The Helm deployment injects these securely into the application pods using the `envFrom: secretRef` specification.
+### 4.4. Interactive Web Dashboard (`idlistack status`)
+Running `idlistack status` starts an embedded Go HTTP/SSE server (default port `4200`) providing:
+- Real-time CPU and Memory monitoring.
+- Interactive Environment Variable & Secret CRUD editor.
+- In-browser interactive container terminal shell.
+- 1-click on-demand SQL database backup streaming.
+- Deployment revision history and 1-click instant Helm rollbacks.
+- Live log streaming and replica scaling controls.
 
 ---
 
 ## 5. Directory Structure & Code Organization
 
 ```text
-idlistack/
-├── main.go                          # CLI Entry point
+CLI/
+├── main.go                          # CLI entry point
 ├── Makefile                         # Build targets (build, install, clean, test)
-├── cmd/                             # Cobra Command Implementations
-│   ├── root.go                      # Global flags and root context
-│   ├── init.go                      # Workspace initialization
-│   ├── up.go                        # The primary 6-stage pipeline orchestrator
+├── PRODUCTION_ARCHITECTURE.md       # Technical architecture specification
+├── README.md                        # Primary user documentation
+├── cmd/                             # Cobra command implementations
+│   ├── root.go                      # Global flags and root command context
+│   ├── init.go                      # Project initialization
+│   ├── up.go                        # The 6-stage deployment pipeline orchestrator
 │   ├── down.go                      # Helm uninstall and namespace teardown
-│   ├── logs.go                      # Streaming log aggregator
-│   ├── status.go                    # Cluster health and URL resolution
-│   └── env.go                       # Secret management
-├── internal/                        # Core Engine Logic
-│   ├── config/                      # TOML parsing schemas
-│   ├── detect/                      # Multi-layer framework detection engine
-│   ├── buildplan/                   # Build plan data structures
+│   ├── logs.go                      # Real-time streaming log aggregator
+│   ├── status.go                    # Terminal health check & web dashboard launcher
+│   └── env.go                       # Kubernetes Secret management
+├── internal/                        # Core internal engine logic
+│   ├── app/                         # Fast in-memory filesystem scanner
+│   ├── buildplan/                   # Standardized build plan schema
+│   ├── config/                      # TOML configuration parser
+│   ├── dashboard/                   # Embedded Web Dashboard server & static assets
+│   ├── detect/                      # Multi-layer detection engine
+│   │   ├── detect.go                # Orchestrator & layer priority
+│   │   ├── railpack.go              # Railpack v0.39+ resolver, downloader & parser
+│   │   ├── rules.go                 # Dynamic framework rules engine
+│   │   ├── frameworks.json          # Specialized framework signatures
+│   │   └── llm.go                   # Gemini AI fallback
 │   ├── k8s/                         # Kubernetes logic
-│   │   └── deployer.go              # Helm scaffolder, upgrader, and rollback manager
-│   └── ui/                          # Terminal UI components (colorization, spinners)
+│   │   └── deployer.go              # Helm chart generator, dependencies, and rollout
+│   └── ui/                          # Terminal UI components and banners
+└── vscode-extension/                # VS Code Marketplace Extension
+    ├── package.json                 # Extension manifest (v1.7.0)
+    ├── extension.js                 # VS Code extension controller & status bar
+    ├── bin/                         # Bundled idlistack executable
+    └── idlistack-vscode-1.7.0.vsix  # Packaged extension bundle
 ```
 
 ---
 
-## 6. Production K3s Management & Debugging
+## 6. Production Management & Debugging
 
-The transition to K3s provides native, production-equivalent debugging pathways. If IdliStack encounters issues, you can inspect the state directly via standard K8s interfaces.
+When managing an IdliStack application directly via Kubernetes:
 
-### Core Debugging Commands
-- **View Cluster State:**
-  ```bash
-  kubectl get all -n idlistack-<app-name>
-  ```
-- **Inspect Helm Releases:**
-  ```bash
-  helm list -A
-  helm history <app-name> -n idlistack-<app-name>
-  ```
-- **Bypass Docker (Direct Containerd Access):**
-  K3s runs its own containerd socket. To view running containers natively:
-  ```bash
-  sudo k3s crictl ps
-  ```
-- **System Logs:**
-  To diagnose node-level or K3s control-plane failures:
-  ```bash
-  sudo journalctl -u k3s -f
-  ```
+```bash
+# View all pods, services, and PVCs
+kubectl get all,pvc -n idlistack-<app-name>
 
----
+# View Helm release history
+helm history <app-name> -n idlistack-<app-name>
 
-## 7. Future Extensibility
+# Roll back manually to a previous revision
+helm rollback <app-name> 1 -n idlistack-<app-name>
 
-The architecture is designed to be highly modular. Future iterations can easily adopt:
-1. **Cloud Deployments:** Changing the `.kube/config` context allows `idlistack up` to target remote production clusters (AWS EKS, DigitalOcean) natively via Helm.
-2. **Ingress Controllers:** The K3s `NodePort` approach can be seamlessly upgraded to emit `Ingress` manifests pointing to K3s's native Traefik router for custom domain binding.
-3. **Provider Expansion:** Adding support for new languages merely requires adding a new file under `internal/detect/` to match signal files.
+# View K3s containerd images natively
+sudo k3s crictl images
+
+# View running containerd containers
+sudo k3s crictl ps
+```

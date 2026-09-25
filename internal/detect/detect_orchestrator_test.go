@@ -48,14 +48,14 @@ func TestDetect_EndToEnd_NoDockerfile(t *testing.T) {
 		t.Fatalf("Detect failed: %v", err)
 	}
 
-	// Should be detected by Layer 1 (provider)
-	if plan.DetectionSource != "provider-node" {
-		t.Errorf("Expected DetectionSource 'provider-node', got %s", plan.DetectionSource)
+	// Should be detected by Layer 1 (railpack or provider fallback)
+	if plan.DetectionSource != "railpack" && plan.DetectionSource != "provider-node" {
+		t.Errorf("Expected DetectionSource 'railpack' or 'provider-node', got %s", plan.DetectionSource)
 	}
 	if plan.Provider != "node" {
 		t.Errorf("Expected Provider 'node', got %s", plan.Provider)
 	}
-	if plan.StartCmd != "npm run start" {
-		t.Errorf("Expected StartCmd 'npm run start', got %s", plan.StartCmd)
+	if plan.StartCmd != "npm run start" && plan.StartCmd != "node server.js" && plan.StartCmd != "npm start" {
+		t.Errorf("Expected valid StartCmd, got %s", plan.StartCmd)
 	}
 }
